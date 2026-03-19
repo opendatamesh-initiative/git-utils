@@ -81,6 +81,9 @@ class GitOperationImplTest {
     @Mock
     private TagCommand tagCommand;
 
+    @Mock
+    private CheckoutCommand checkoutCommand;
+
     private GitCredentialHttps credential;
     private GitOperationImpl sut;
 
@@ -160,8 +163,8 @@ class GitOperationImplTest {
     // --- readRepository ---
 
     /**
-     * Scenario: clone by branch; remote has the branch; shallow clone is configured.
-     * Verifies: ls-remote, clone with branch/depth, and consumer invoked with repo dir.
+     * Scenario: clone by branch; remote has the branch; shallow clone of only that branch.
+     * Verifies: ls-remote, clone with branch, depth 1, setBranchesToClone(single branch), and consumer invoked with repo dir.
      */
     @Test
     void whenReadRepositoryBranchThenInvokeConsumerWithRepoDir() throws Exception {
@@ -200,6 +203,56 @@ class GitOperationImplTest {
         assertThat(capturedDir.get()).isNotNull();
         verify(gitFactory).lsRemoteRepository();
         verify(gitFactory).cloneRepository();
+        verify(cloneCommand).setBranch(Constants.R_HEADS + "main");
+        verify(cloneCommand).setDepth(1);
+        verify(cloneCommand).setBranchesToClone(Collections.singletonList(Constants.R_HEADS + "main"));
+        verify(cloneCommand).call();
+    }
+
+    /**
+     * Scenario: clone by branch when remote has no refs (empty repo); shallow clone and orphan branch are used.
+     * Verifies: shallow clone (branch + depth 1), orphan checkout; setBranchesToClone is NOT called (ref does not exist on remote).
+     */
+    @Test
+    void whenReadRepositoryBranchOnEmptyRemoteThenDoNotSetBranchesToClone() throws Exception {
+        // Given: branch pointer but remote returns no refs (empty repo)
+        org.opendatamesh.platform.git.model.Repository repo = validRepository();
+        repo.setCloneUrlHttp(CLONE_URL_HTTP);
+        RepositoryPointerBranch pointer = new RepositoryPointerBranch("main");
+        AtomicReference<File> capturedDir = new AtomicReference<>();
+        Consumer<File> consumer = dir -> {
+            assertThat(dir).exists();
+            capturedDir.set(dir);
+        };
+
+        Collection<Ref> refs = Collections.emptyList();
+
+        when(gitFactory.lsRemoteRepository()).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setRemote(anyString())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setCredentialsProvider(any())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.call()).thenReturn(refs);
+
+        when(gitFactory.cloneRepository()).thenReturn(cloneCommand);
+        when(cloneCommand.setURI(anyString())).thenReturn(cloneCommand);
+        when(cloneCommand.setDirectory(any(File.class))).thenReturn(cloneCommand);
+        when(cloneCommand.setCredentialsProvider(any())).thenReturn(cloneCommand);
+        when(cloneCommand.setBranch(anyString())).thenReturn(cloneCommand);
+        when(cloneCommand.setDepth(anyInt())).thenReturn(cloneCommand);
+        when(cloneCommand.call()).thenReturn(git);
+        when(git.checkout()).thenReturn(checkoutCommand);
+        when(checkoutCommand.setOrphan(anyBoolean())).thenReturn(checkoutCommand);
+        when(checkoutCommand.setName(anyString())).thenReturn(checkoutCommand);
+
+        // When
+        sut.readRepository(repo, pointer, consumer);
+
+        // Then: shallow clone is used but setBranchesToClone must not be called (ref does not exist)
+        assertThat(capturedDir.get()).isNotNull();
+        verify(gitFactory).lsRemoteRepository();
+        verify(gitFactory).cloneRepository();
+        verify(cloneCommand).setBranch(Constants.R_HEADS + "main");
+        verify(cloneCommand).setDepth(1);
+        verify(cloneCommand, never()).setBranchesToClone(anyList());
         verify(cloneCommand).call();
     }
 
@@ -276,8 +329,6 @@ class GitOperationImplTest {
         when(cloneCommand.setDirectory(any(File.class))).thenReturn(cloneCommand);
         when(cloneCommand.setCredentialsProvider(any())).thenReturn(cloneCommand);
         when(cloneCommand.call()).thenReturn(git);
-
-        CheckoutCommand checkoutCommand = mock(CheckoutCommand.class);
         when(git.checkout()).thenReturn(checkoutCommand);
         when(checkoutCommand.setName(anyString())).thenReturn(checkoutCommand);
 

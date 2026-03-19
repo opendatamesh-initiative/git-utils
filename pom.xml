@@ -7,7 +7,7 @@
 
     <groupId>org.opendatamesh</groupId>
     <artifactId>git-utils</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <url>https://github.com/opendatamesh-initiative/git-utils</url>
     <packaging>jar</packaging>
 

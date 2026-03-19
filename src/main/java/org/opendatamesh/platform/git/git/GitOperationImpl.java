@@ -278,10 +278,15 @@ public class GitOperationImpl implements GitOperation {
                             pointer.getRefType().name(), cleanName));
         }
 
-        // Optimization: Shallow clone of ONLY the requested ref
+
         cloneCommand.setBranch(exactRefPath)
-                .setBranchesToClone(Collections.singletonList(exactRefPath))
+                // Optimization: shallow clone
                 .setDepth(1);
+
+        // Optimization: clone of ONLY the requested ref
+        if (refExistsOnRemote) {
+            cloneCommand.setBranchesToClone(Collections.singletonList(exactRefPath));
+        }
 
         try (Git git = cloneCommand.call()) {
             // If it's a completely empty repo, initialize it with an orphan branch
@@ -306,7 +311,9 @@ public class GitOperationImpl implements GitOperation {
         if (isEmptyRepo) {
             throw new GitOperationException("readRepository",
                     "Cannot checkout a TAG because the remote repository is completely empty.");
-        } else if (!refExistsOnRemote) {
+        }
+
+        if (!refExistsOnRemote) {
             throw new GitOperationException("readRepository",
                     String.format("The requested %s '%s' does not exist on the remote repository.",
                             pointer.getRefType().name(), cleanName));
