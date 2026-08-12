@@ -9,6 +9,9 @@ import org.opendatamesh.platform.git.model.*;
 import org.opendatamesh.platform.git.provider.GitProvider;
 import org.opendatamesh.platform.git.provider.GitProviderCredential;
 import org.opendatamesh.platform.git.provider.github.comparator.GitHubCommitComparator;
+import org.opendatamesh.platform.git.provider.github.resources.createpullrequest.GitHubCreatePullRequestMapper;
+import org.opendatamesh.platform.git.provider.github.resources.createpullrequest.GitHubCreatePullRequestReq;
+import org.opendatamesh.platform.git.provider.github.resources.createpullrequest.GitHubCreatePullRequestRes;
 import org.opendatamesh.platform.git.provider.github.resources.createrepository.GitHubCreateRepositoryMapper;
 import org.opendatamesh.platform.git.provider.github.resources.createrepository.GitHubCreateRepositoryRepositoryRes;
 import org.opendatamesh.platform.git.provider.github.resources.createrepository.GitHubCreateRepositoryReq;
@@ -39,6 +42,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.MultiValueMap;
+import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.client.RestTemplate;
@@ -508,6 +512,71 @@ public class GitHubProvider implements GitProvider {
     @Override
     public GitOperation gitOperation() {
         return new GitOperationImpl(credential.createGitCredential());
+    }
+
+    @Override
+    public PullRequest createPullRequest(Repository repository, CreatePullRequest createPullRequest) {
+        String resolvedTarget = resolveAndValidateCreatePullRequest(repository, createPullRequest);
+        try {
+            HttpHeaders headers = credential.createGitProviderHeaders();
+            headers.set("Content-Type", "application/json");
+
+            GitHubCreatePullRequestReq request = GitHubCreatePullRequestMapper.fromInternalModel(createPullRequest, resolvedTarget);
+            HttpEntity<GitHubCreatePullRequestReq> entity = new HttpEntity<>(request, headers);
+
+            String ownerName = getOwnerName(repository);
+            String uriTemplate = baseUrl + "/repos/{owner}/{repo}/pulls";
+            Map<String, Object> uriVariables = new HashMap<>();
+            uriVariables.put("owner", ownerName);
+            uriVariables.put("repo", repository.getName());
+
+            ResponseEntity<GitHubCreatePullRequestRes> response = restTemplate.exchange(
+                    uriTemplate,
+                    HttpMethod.POST,
+                    entity,
+                    GitHubCreatePullRequestRes.class,
+                    uriVariables
+            );
+
+            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
+                return GitHubCreatePullRequestMapper.toInternalModel(response.getBody(), createPullRequest, resolvedTarget);
+            }
+            throw new GitClientException(response.getStatusCode().value(),
+                    "Failed to create pull request. Status: " + response.getStatusCode());
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 401) {
+                throw new GitProviderAuthenticationException("GitHub authentication failed with provider. Please check your credentials.");
+            }
+            throw new GitClientException(e.getStatusCode().value(),
+                    "GitHub request failed to create pull request: " + e.getResponseBodyAsString());
+        } catch (RestClientException e) {
+            throw new GitClientException(500, "GitHub request failed to create pull request: " + e.getMessage());
+        }
+    }
+
+    private String resolveAndValidateCreatePullRequest(Repository repository, CreatePullRequest createPullRequest) {
+        if (repository == null) {
+            throw new IllegalArgumentException("Repository is required");
+        }
+        if (createPullRequest == null) {
+            throw new IllegalArgumentException("CreatePullRequest is required");
+        }
+        if (!StringUtils.hasText(createPullRequest.getSourceBranch())) {
+            throw new IllegalArgumentException("sourceBranch is required");
+        }
+        if (!StringUtils.hasText(createPullRequest.getTitle())) {
+            throw new IllegalArgumentException("title is required");
+        }
+        String resolvedTarget = StringUtils.hasText(createPullRequest.getTargetBranch())
+                ? createPullRequest.getTargetBranch()
+                : repository.getDefaultBranch();
+        if (!StringUtils.hasText(resolvedTarget)) {
+            throw new IllegalArgumentException("targetBranch is required when repository defaultBranch is blank");
+        }
+        if (createPullRequest.getSourceBranch().equals(resolvedTarget)) {
+            throw new IllegalArgumentException("sourceBranch and targetBranch must be different");
+        }
+        return resolvedTarget;
     }
 
     private String getOwnerName(Repository repository) {

@@ -1,0 +1,9 @@
+{
+  "iid": 7,
+  "web_url": "https://gitlab.com/test-group/test-repo/-/merge_requests/7",
+  "state": "opened",
+  "title": "Update v2",
+  "description": "Generated update",
+  "source_branch": "update-v2",
+  "target_branch": "main"
+}

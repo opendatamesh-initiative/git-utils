@@ -9,6 +9,9 @@ import org.opendatamesh.platform.git.git.GitOperationImpl;
 import org.opendatamesh.platform.git.model.*;
 import org.opendatamesh.platform.git.provider.*;
 import org.opendatamesh.platform.git.provider.bitbucket.modelextensions.BitbucketRepositoryExtension;
+import org.opendatamesh.platform.git.provider.bitbucket.resources.createpullrequest.BitbucketCreatePullRequestMapper;
+import org.opendatamesh.platform.git.provider.bitbucket.resources.createpullrequest.BitbucketCreatePullRequestReq;
+import org.opendatamesh.platform.git.provider.bitbucket.resources.createpullrequest.BitbucketCreatePullRequestRes;
 import org.opendatamesh.platform.git.provider.bitbucket.resources.createrepository.BitbucketCreateRepositoryMapper;
 import org.opendatamesh.platform.git.provider.bitbucket.resources.createrepository.BitbucketCreateRepositoryRepositoryRes;
 import org.opendatamesh.platform.git.provider.bitbucket.resources.createrepository.BitbucketCreateRepositoryReq;
@@ -571,6 +574,70 @@ public class BitbucketProvider implements GitProvider, GitProviderExtension {
     @Override
     public GitOperation gitOperation() {
         return new GitOperationImpl(credential.createGitCredential());
+    }
+
+    @Override
+    public PullRequest createPullRequest(Repository repository, CreatePullRequest createPullRequest) {
+        String resolvedTarget = resolveAndValidateCreatePullRequest(repository, createPullRequest);
+        try {
+            HttpHeaders headers = credential.createGitProviderHeaders();
+            headers.set("Content-Type", "application/json");
+
+            BitbucketCreatePullRequestReq request = BitbucketCreatePullRequestMapper.fromInternalModel(createPullRequest, resolvedTarget);
+            HttpEntity<BitbucketCreatePullRequestReq> entity = new HttpEntity<>(request, headers);
+
+            String uriTemplate = baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests";
+            Map<String, Object> uriVariables = new HashMap<>();
+            uriVariables.put("ownerId", repository.getOwnerId());
+            uriVariables.put("repoName", repository.getName());
+
+            ResponseEntity<BitbucketCreatePullRequestRes> response = restTemplate.exchange(
+                    uriTemplate,
+                    HttpMethod.POST,
+                    entity,
+                    BitbucketCreatePullRequestRes.class,
+                    uriVariables
+            );
+
+            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
+                return BitbucketCreatePullRequestMapper.toInternalModel(response.getBody(), createPullRequest, resolvedTarget);
+            }
+            throw new GitClientException(response.getStatusCode().value(),
+                    "Failed to create pull request. Status: " + response.getStatusCode());
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 401) {
+                throw new GitProviderAuthenticationException("Bitbucket authentication failed with provider. Please check your credentials.");
+            }
+            throw new GitClientException(e.getStatusCode().value(),
+                    "Bitbucket request failed to create pull request: " + e.getResponseBodyAsString());
+        } catch (RestClientException e) {
+            throw new GitClientException(500, "Bitbucket request failed to create pull request: " + e.getMessage());
+        }
+    }
+
+    private String resolveAndValidateCreatePullRequest(Repository repository, CreatePullRequest createPullRequest) {
+        if (repository == null) {
+            throw new IllegalArgumentException("Repository is required");
+        }
+        if (createPullRequest == null) {
+            throw new IllegalArgumentException("CreatePullRequest is required");
+        }
+        if (!StringUtils.hasText(createPullRequest.getSourceBranch())) {
+            throw new IllegalArgumentException("sourceBranch is required");
+        }
+        if (!StringUtils.hasText(createPullRequest.getTitle())) {
+            throw new IllegalArgumentException("title is required");
+        }
+        String resolvedTarget = StringUtils.hasText(createPullRequest.getTargetBranch())
+                ? createPullRequest.getTargetBranch()
+                : repository.getDefaultBranch();
+        if (!StringUtils.hasText(resolvedTarget)) {
+            throw new IllegalArgumentException("targetBranch is required when repository defaultBranch is blank");
+        }
+        if (createPullRequest.getSourceBranch().equals(resolvedTarget)) {
+            throw new IllegalArgumentException("sourceBranch and targetBranch must be different");
+        }
+        return resolvedTarget;
     }
 
     @Override

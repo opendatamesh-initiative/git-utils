@@ -2,12 +2,22 @@ package org.opendatamesh.platform.git.git;
 
 import org.eclipse.jgit.api.*;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.dircache.DirCache;
+import org.eclipse.jgit.dircache.DirCacheCheckout;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.RepositoryState;
+import org.eclipse.jgit.merge.ResolveMerger;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.revwalk.filter.RevFilter;
 import org.eclipse.jgit.transport.CredentialsProvider;
+import org.eclipse.jgit.transport.PushResult;
+import org.eclipse.jgit.transport.RefSpec;
+import org.eclipse.jgit.transport.RemoteRefUpdate;
 import org.eclipse.jgit.transport.URIish;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.opendatamesh.platform.git.exceptions.GitOperationException;
@@ -47,7 +57,8 @@ public class GitOperationImpl implements GitOperation {
     }
 
     /**
-     * Constructor for unit tests: allows injecting a custom factory to mock Git operations.
+     * Constructor for unit tests: allows injecting a custom factory to mock Git
+     * operations.
      */
     protected GitOperationImpl(GitCredential authContext, JGitFactory gitFactory) {
         this.authContext = authContext;
@@ -241,23 +252,242 @@ public class GitOperationImpl implements GitOperation {
     }
 
     @Override
+    public void pushBranch(File repoDir, String branchName) {
+        if (repoDir == null || !repoDir.exists()) {
+            throw new GitOperationException("pushBranch", "Valid repository directory is required");
+        }
+        if (!StringUtils.hasText(branchName)) {
+            throw new GitOperationException("pushBranch", "Branch name is required");
+        }
+
+        String bareName = toBareBranchName(branchName);
+        if (!StringUtils.hasText(bareName)) {
+            throw new GitOperationException("pushBranch", "Branch name is required");
+        }
+        String fullBranchRef = Constants.R_HEADS + bareName;
+
+        try (Git git = gitFactory.open(repoDir)) {
+            ObjectId localRef = git.getRepository().resolve(fullBranchRef);
+            if (localRef == null) {
+                throw new GitOperationException("pushBranch", "Local branch does not exist: " + bareName);
+            }
+
+            CredentialsProvider cp = buildCredentialsProvider(authContext);
+            RefSpec branchRefSpec = new RefSpec(fullBranchRef + ":" + fullBranchRef);
+            PushCommand pushCommand = git.push()
+                    .setRemote(Constants.DEFAULT_REMOTE_NAME)
+                    .setCredentialsProvider(cp)
+                    .setRefSpecs(branchRefSpec);
+            Iterable<PushResult> pushResults = pushCommand.call();
+            assertSuccessfulRemoteUpdates("pushBranch", pushResults);
+        } catch (GitOperationException e) {
+            throw e;
+        } catch (IOException | GitAPIException e) {
+            throw new GitOperationException("pushBranch", "Failed to push branch: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void pushTag(File repoDir, String tagName) {
+        if (repoDir == null || !repoDir.exists()) {
+            throw new GitOperationException("pushTag", "Valid repository directory is required");
+        }
+        if (!StringUtils.hasText(tagName)) {
+            throw new GitOperationException("pushTag", "Tag name is required");
+        }
+
+        String bareName = toBareTagName(tagName);
+        if (!StringUtils.hasText(bareName)) {
+            throw new GitOperationException("pushTag", "Tag name is required");
+        }
+        String fullTagRef = Constants.R_TAGS + bareName;
+
+        try (Git git = gitFactory.open(repoDir)) {
+            ObjectId localRef = git.getRepository().resolve(fullTagRef);
+            if (localRef == null) {
+                throw new GitOperationException("pushTag", "Local tag does not exist: " + bareName);
+            }
+
+            CredentialsProvider cp = buildCredentialsProvider(authContext);
+            RefSpec tagRefSpec = new RefSpec(fullTagRef + ":" + fullTagRef);
+            PushCommand pushCommand = git.push()
+                    .setRemote(Constants.DEFAULT_REMOTE_NAME)
+                    .setCredentialsProvider(cp)
+                    .setRefSpecs(tagRefSpec);
+            Iterable<PushResult> pushResults = pushCommand.call();
+            assertSuccessfulRemoteUpdates("pushTag", pushResults);
+        } catch (GitOperationException e) {
+            throw e;
+        } catch (IOException | GitAPIException e) {
+            throw new GitOperationException("pushTag", "Failed to push tag: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public String createAndCheckoutBranch(File repoDir, String branchName) {
+        if (repoDir == null || !repoDir.exists()) {
+            throw new GitOperationException("createAndCheckoutBranch", "Valid repository directory is required");
+        }
+        String bareName = normalizeLocalBranchName("createAndCheckoutBranch", branchName);
+        String fullBranchRef = Constants.R_HEADS + bareName;
+
+        try (Git git = gitFactory.open(repoDir)) {
+            assertBranchNameAvailableOnLocalAndOrigin(
+                    "createAndCheckoutBranch", git.getRepository(), fullBranchRef, bareName);
+
+            git.branchCreate().setName(bareName).call();
+            git.checkout().setName(bareName).call();
+
+            ObjectId head = git.getRepository().resolve(Constants.HEAD);
+            if (head == null) {
+                throw new GitOperationException("createAndCheckoutBranch",
+                        "Cannot resolve HEAD after creating branch: " + bareName);
+            }
+            return head.getName();
+        } catch (GitOperationException e) {
+            throw e;
+        } catch (IOException | GitAPIException e) {
+            throw new GitOperationException("createAndCheckoutBranch",
+                    "Failed to create and check out branch: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void createAndCheckoutOrphanBranch(File repoDir, String branchName) {
+        if (repoDir == null || !repoDir.isDirectory()) {
+            throw new GitOperationException("createAndCheckoutOrphanBranch", "Valid repository directory is required");
+        }
+        String bareName = normalizeLocalBranchName("createAndCheckoutOrphanBranch", branchName);
+        String fullBranchRef = Constants.R_HEADS + bareName;
+
+        try (Git git = gitFactory.open(repoDir)) {
+            org.eclipse.jgit.lib.Repository repository = git.getRepository();
+            assertPristineRepository("createAndCheckoutOrphanBranch", git);
+            assertBranchNameAvailableOnLocalAndOrigin(
+                    "createAndCheckoutOrphanBranch", repository, fullBranchRef, bareName);
+
+            String originalBranch = repository.getFullBranch();
+            ObjectId originalHead = repository.resolve(Constants.HEAD);
+            boolean mutationStarted = false;
+            try {
+                mutationStarted = true;
+                git.checkout().setOrphan(true).setName(bareName).call();
+                clearIndex(repository);
+                deleteWorkTreeContents(repoDir.toPath(), repository.getDirectory().toPath());
+                assertEmptyOrphanState(repository, repoDir.toPath(), fullBranchRef);
+            } catch (Exception failure) {
+                if (mutationStarted) {
+                    try {
+                        restoreOriginalCheckout(git, originalBranch, originalHead, fullBranchRef);
+                    } catch (Exception rollbackFailure) {
+                        failure.addSuppressed(rollbackFailure);
+                    }
+                }
+                throw new GitOperationException("createAndCheckoutOrphanBranch",
+                        "Failed to create pure orphan branch: " + failure.getMessage(), failure);
+            }
+        } catch (GitOperationException e) {
+            throw e;
+        } catch (IOException | GitAPIException e) {
+            throw new GitOperationException("createAndCheckoutOrphanBranch",
+                    "Failed to open repository: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public String mergeBranch(File repoDir, String sourceBranch, String targetBranch) {
+        if (repoDir == null || !repoDir.isDirectory()) {
+            throw new GitOperationException("mergeBranch", "Valid repository directory is required");
+        }
+        String sourceName = normalizeLocalBranchName("mergeBranch", sourceBranch);
+        String targetName = normalizeLocalBranchName("mergeBranch", targetBranch);
+        if (sourceName.equals(targetName)) {
+            throw new GitOperationException("mergeBranch", "Source and target branches must differ");
+        }
+
+        String sourceRefName = Constants.R_HEADS + sourceName;
+        String targetRefName = Constants.R_HEADS + targetName;
+        try (Git git = gitFactory.open(repoDir)) {
+            org.eclipse.jgit.lib.Repository repository = git.getRepository();
+            assertPristineRepository("mergeBranch", git);
+            ObjectId sourceTip = requireLocalBranch(repository, sourceRefName, sourceName);
+            ObjectId targetTip = requireLocalBranch(repository, targetRefName, targetName);
+
+            boolean mutationStarted = false;
+            try {
+                mutationStarted = true;
+                git.checkout().setName(targetName).call();
+                assertPristineRepository("mergeBranch", git);
+
+                if (sourceTip.equals(targetTip)) {
+                    return targetTip.getName();
+                }
+
+                String message = "Merge branch '" + sourceName + "' into '" + targetName + "'";
+                ObjectId result;
+                if (hasCommonAncestor(repository, targetTip, sourceTip)) {
+                    MergeResult mergeResult = git.merge()
+                            .include(repository.exactRef(sourceRefName))
+                            .setMessage(message)
+                            .call();
+                    if (!mergeResult.getMergeStatus().isSuccessful()) {
+                        throw new GitOperationException("mergeBranch",
+                                "Merge failed with status " + mergeResult.getMergeStatus());
+                    }
+                    result = repository.resolve(targetRefName);
+                } else {
+                    result = mergeUnrelatedHistories(
+                            git, repository, targetRefName, targetTip, sourceTip, message);
+                }
+
+                if (result == null) {
+                    throw new GitOperationException("mergeBranch",
+                            "Cannot resolve target branch after merge: " + targetName);
+                }
+                return result.getName();
+            } catch (Exception failure) {
+                if (mutationStarted) {
+                    try {
+                        restoreMergeTarget(git, targetName, targetTip);
+                    } catch (Exception rollbackFailure) {
+                        failure.addSuppressed(rollbackFailure);
+                    }
+                }
+                if (failure instanceof GitOperationException) {
+                    throw (GitOperationException) failure;
+                }
+                throw new GitOperationException("mergeBranch",
+                        "Failed to merge branch: " + failure.getMessage(), failure);
+            }
+        } catch (GitOperationException e) {
+            throw e;
+        } catch (IOException | GitAPIException e) {
+            throw new GitOperationException("mergeBranch",
+                    "Failed to open repository: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
     public String getHeadSha(File repoDir, String branchName) {
         if (repoDir == null || !repoDir.exists()) {
             throw new GitOperationException("getLatestCommitSha", "Valid repository directory is required");
         }
         if (!StringUtils.hasText(branchName)) {
-            throw new GitOperationException("getLatestCommitSha", "Branch name is required to retrieve the latest commit SHA");
+            throw new GitOperationException("getLatestCommitSha",
+                    "Branch name is required to retrieve the latest commit SHA");
         }
 
         try (Git git = gitFactory.open(repoDir)) {
             String branchRef = toFullBranchRef(branchName);
             ObjectId commitId = git.getRepository().resolve(branchRef);
             if (commitId == null) {
-                throw new GitOperationException("getLatestCommitSha", "Cannot resolve latest commit for branch: " + branchName);
+                throw new GitOperationException("getLatestCommitSha",
+                        "Cannot resolve latest commit for branch: " + branchName);
             }
             return commitId.getName();
         } catch (IOException e) {
-            throw new GitOperationException("getLatestCommitSha", "Failed to get latest commit SHA: " + e.getMessage(), e);
+            throw new GitOperationException("getLatestCommitSha", "Failed to get latest commit SHA: " + e.getMessage(),
+                    e);
         }
     }
 
@@ -296,9 +526,273 @@ public class GitOperationImpl implements GitOperation {
 
     // --- Private Helper & Validation Methods ---
 
-    private void cloneRepositoryAndBranchCheckout(RepositoryPointer pointer, Collection<Ref> remoteRefs, boolean isEmptyRepo, CloneCommand cloneCommand) throws GitAPIException {
+    /**
+     * Normalizes a local branch name by removing the prefix and validating the
+     * name.
+     * 
+     * @param operation  The operation that is being performed.
+     * @param branchName The branch name to normalize.
+     * @return The normalized branch name.
+     * @throws GitOperationException If the branch name is invalid.
+     */
+    private String normalizeLocalBranchName(String operation, String branchName) {
+        if (!StringUtils.hasText(branchName)) {
+            throw new GitOperationException(operation, "Branch name is required");
+        }
+        String normalized = branchName.trim();
+        if (normalized.startsWith(Constants.R_HEADS)) {
+            normalized = normalized.substring(Constants.R_HEADS.length());
+        } else if (normalized.startsWith(Constants.R_REFS)) {
+            throw new GitOperationException(operation, "Only local branch names are supported");
+        }
+        if (!StringUtils.hasText(normalized)
+                || !org.eclipse.jgit.lib.Repository.isValidRefName(Constants.R_HEADS + normalized)) {
+            throw new GitOperationException(operation, "Invalid branch name: " + branchName);
+        }
+        return normalized;
+    }
+
+    /**
+     * Asserts that the repository is in a pristine state.
+     * 
+     * @param operation The operation that is being performed.
+     * @param git       The Git instance.
+     * @throws GitAPIException If the repository is not in a pristine state.
+     */
+    private void assertPristineRepository(String operation, Git git) throws GitAPIException {
+        org.eclipse.jgit.lib.Repository repository = git.getRepository();
+        if (repository.getRepositoryState() != RepositoryState.SAFE) {
+            throw new GitOperationException(operation,
+                    "Repository has an unfinished operation: " + repository.getRepositoryState());
+        }
+        Status repositoryStatus = git.status().call();
+        if (!repositoryStatus.isClean() || !repositoryStatus.getIgnoredNotInIndex().isEmpty()) {
+            throw new GitOperationException(operation,
+                    "Repository work tree, index, and ignored files must be pristine");
+        }
+    }
+
+    /**
+     * Asserts that the branch name is available on the local and origin
+     * repositories by checking if the branch exists locally, on the origin, or if
+     * the full branch reference is already resolved.
+     * 
+     * @param operation     The operation that is being performed.
+     * @param repository    The repository.
+     * @param fullBranchRef The full branch reference.
+     * @param bareName      The bare branch name.
+     * @throws IOException If the branch name is not available on the local and
+     *                     origin repositories.
+     */
+    private void assertBranchNameAvailableOnLocalAndOrigin(
+            String operation,
+            org.eclipse.jgit.lib.Repository repository,
+            String fullBranchRef,
+            String bareName) throws IOException {
+        if (fullBranchRef.equals(repository.getFullBranch())
+                || repository.exactRef(fullBranchRef) != null
+                || repository.resolve(fullBranchRef) != null) {
+            throw new GitOperationException(operation, "Branch already exists locally: " + bareName);
+        }
+
+        String originUrl = repository.getConfig()
+                .getString("remote", Constants.DEFAULT_REMOTE_NAME, "url");
+        if (!StringUtils.hasText(originUrl)) {
+            throw new GitOperationException(operation, "Remote origin URL is not configured");
+        }
+
+        try {
+            Collection<Ref> remoteRefs = gitFactory.lsRemoteRepository()
+                    .setRemote(originUrl)
+                    .setCredentialsProvider(buildCredentialsProvider(authContext))
+                    .call();
+            if (remoteRefs != null && remoteRefs.stream()
+                    .anyMatch(ref -> fullBranchRef.equals(ref.getName()))) {
+                throw new GitOperationException(operation,
+                        "Branch already exists on origin: " + bareName);
+            }
+        } catch (GitOperationException e) {
+            throw e;
+        } catch (GitAPIException e) {
+            throw new GitOperationException(operation,
+                    "Failed to check remote branch existence: " + e.getMessage(), e);
+        }
+    }
+
+    private void clearIndex(org.eclipse.jgit.lib.Repository repository) throws IOException {
+        DirCache index = repository.lockDirCache();
+        boolean committed = false;
+        try {
+            index.clear();
+            index.write();
+            committed = index.commit();
+        } finally {
+            if (!committed) {
+                index.unlock();
+            }
+        }
+        if (!committed) {
+            throw new IOException("Cannot replace the repository index");
+        }
+    }
+
+    private void deleteWorkTreeContents(Path workTree, Path metadataDirectory) throws IOException {
+        Path normalizedMetadata = metadataDirectory.toAbsolutePath().normalize();
+        try (Stream<Path> children = Files.list(workTree)) {
+            for (Path child : children.toList()) {
+                Path normalizedChild = child.toAbsolutePath().normalize();
+                if (Constants.DOT_GIT.equals(child.getFileName().toString())
+                        || normalizedMetadata.equals(normalizedChild)
+                        || normalizedMetadata.startsWith(normalizedChild)) {
+                    continue;
+                }
+                deletePath(child);
+            }
+        }
+    }
+
+    private void deletePath(Path path) throws IOException {
+        try (Stream<Path> paths = Files.walk(path)) {
+            for (Path item : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.delete(item);
+            }
+        }
+    }
+
+    private void assertEmptyOrphanState(
+            org.eclipse.jgit.lib.Repository repository,
+            Path workTree,
+            String fullBranchRef) throws IOException {
+        if (!fullBranchRef.equals(repository.getFullBranch())
+                || repository.resolve(Constants.HEAD) != null
+                || repository.readDirCache().getEntryCount() != 0) {
+            throw new IOException("Orphan branch is not unborn with an empty index");
+        }
+        try (Stream<Path> children = Files.list(workTree)) {
+            boolean hasWorkTreeContent = children
+                    .anyMatch(path -> !Constants.DOT_GIT.equals(path.getFileName().toString())
+                            && !repository.getDirectory().toPath().toAbsolutePath().normalize()
+                                    .startsWith(path.toAbsolutePath().normalize()));
+            if (hasWorkTreeContent) {
+                throw new IOException("Orphan branch work tree is not empty");
+            }
+        }
+    }
+
+    private void restoreOriginalCheckout(
+            Git git,
+            String originalBranch,
+            ObjectId originalHead,
+            String orphanRef) throws GitAPIException, IOException {
+        if (originalHead != null) {
+            String checkoutName = originalBranch != null && originalBranch.startsWith(Constants.R_HEADS)
+                    ? originalBranch.substring(Constants.R_HEADS.length())
+                    : originalHead.getName();
+            git.checkout().setName(checkoutName).setForced(true).call();
+            git.reset().setMode(ResetCommand.ResetType.HARD).setRef(originalHead.getName()).call();
+        }
+        Ref orphan = git.getRepository().exactRef(orphanRef);
+        if (orphan != null) {
+            git.branchDelete()
+                    .setBranchNames(orphanRef.substring(Constants.R_HEADS.length()))
+                    .setForce(true)
+                    .call();
+        }
+    }
+
+    private ObjectId requireLocalBranch(
+            org.eclipse.jgit.lib.Repository repository,
+            String fullRef,
+            String bareName) throws IOException {
+        Ref ref = repository.exactRef(fullRef);
+        ObjectId tip = ref == null ? null : ref.getObjectId();
+        if (tip == null) {
+            throw new GitOperationException("mergeBranch",
+                    "Local branch does not exist or is unborn: " + bareName);
+        }
+        return tip;
+    }
+
+    private boolean hasCommonAncestor(
+            org.eclipse.jgit.lib.Repository repository,
+            ObjectId targetTip,
+            ObjectId sourceTip) throws IOException {
+        try (RevWalk walk = gitFactory.createRevWalk(repository)) {
+            RevCommit target = walk.parseCommit(targetTip);
+            RevCommit source = walk.parseCommit(sourceTip);
+            walk.setRevFilter(RevFilter.MERGE_BASE);
+            walk.markStart(target);
+            walk.markStart(source);
+            return walk.next() != null;
+        }
+    }
+
+    private ObjectId mergeUnrelatedHistories(
+            Git git,
+            org.eclipse.jgit.lib.Repository repository,
+            String targetRef,
+            ObjectId targetTip,
+            ObjectId sourceTip,
+            String message) throws IOException, GitAPIException {
+        RevTree targetTree;
+        RevTree sourceTree;
+        try (RevWalk walk = gitFactory.createRevWalk(repository)) {
+            targetTree = walk.parseCommit(targetTip).getTree();
+            sourceTree = walk.parseCommit(sourceTip).getTree();
+        }
+
+        UnrelatedHistoryMerger merger = new UnrelatedHistoryMerger(repository);
+        if (!merger.merge(targetTree, sourceTree)) {
+            throw new GitOperationException("mergeBranch",
+                    "Unrelated histories conflict at " + merger.getUnmergedPaths());
+        }
+
+        DirCacheCheckout checkout = new DirCacheCheckout(
+                repository, targetTree, repository.lockDirCache(), merger.getResultTreeId());
+        checkout.setFailOnConflict(true);
+        checkout.checkout();
+
+        repository.writeMergeCommitMsg(message);
+        repository.writeMergeHeads(Collections.singletonList(sourceTip));
+        ObjectId mergeCommit = git.commit().setMessage(message).call().getId();
+        ObjectId updatedTarget = repository.resolve(targetRef);
+        if (!mergeCommit.equals(updatedTarget)) {
+            throw new GitOperationException("mergeBranch",
+                    "Target branch did not advance to the unrelated-history merge commit");
+        }
+        return mergeCommit;
+    }
+
+    private void restoreMergeTarget(Git git, String targetName, ObjectId targetTip)
+            throws GitAPIException, IOException {
+        String currentBranch = git.getRepository().getBranch();
+        if (!targetName.equals(currentBranch)) {
+            git.checkout().setName(targetName).setForced(true).call();
+        }
+        git.reset().setMode(ResetCommand.ResetType.HARD).setRef(targetTip.getName()).call();
+        git.getRepository().writeMergeCommitMsg(null);
+        git.getRepository().writeMergeHeads(null);
+    }
+
+    private static final class UnrelatedHistoryMerger extends ResolveMerger {
+        private UnrelatedHistoryMerger(org.eclipse.jgit.lib.Repository repository) {
+            super(repository, true);
+        }
+
+        private boolean merge(RevTree targetTree, RevTree sourceTree) throws IOException {
+            return mergeTrees(
+                    new org.eclipse.jgit.treewalk.EmptyTreeIterator(),
+                    targetTree,
+                    sourceTree,
+                    false);
+        }
+    }
+
+    private void cloneRepositoryAndBranchCheckout(RepositoryPointer pointer, Collection<Ref> remoteRefs,
+            boolean isEmptyRepo, CloneCommand cloneCommand) throws GitAPIException {
         String refValue = pointer.getRefValue();
-        String cleanName = refValue.startsWith(Constants.R_HEADS) ? refValue.substring(Constants.R_HEADS.length()) : refValue;
+        String cleanName = refValue.startsWith(Constants.R_HEADS) ? refValue.substring(Constants.R_HEADS.length())
+                : refValue;
         String exactRefPath = Constants.R_HEADS + cleanName;
         boolean refExistsOnRemote = remoteRefs.stream()
                 .anyMatch(r -> r.getName().equals(exactRefPath));
@@ -308,7 +802,6 @@ public class GitOperationImpl implements GitOperation {
                     String.format("The requested %s '%s' does not exist on the remote repository.",
                             pointer.getRefType().name(), cleanName));
         }
-
 
         cloneCommand.setBranch(exactRefPath)
                 // Optimization: shallow clone
@@ -324,15 +817,18 @@ public class GitOperationImpl implements GitOperation {
             if (isEmptyRepo) {
                 git.checkout().setOrphan(true).setName(cleanName).call();
             }
-            // (If the ref existed, JGit automatically checked it out during the shallow clone)
+            // (If the ref existed, JGit automatically checked it out during the shallow
+            // clone)
         }
     }
 
-    private void cloneRepositoryAndTagCheckout(RepositoryPointer pointer, Collection<Ref> remoteRefs, boolean isEmptyRepo, CloneCommand cloneCommand) throws GitAPIException {
+    private void cloneRepositoryAndTagCheckout(RepositoryPointer pointer, Collection<Ref> remoteRefs,
+            boolean isEmptyRepo, CloneCommand cloneCommand) throws GitAPIException {
         String refValue = pointer.getRefValue();
 
         // Normalize the name and build the exact path
-        String cleanName = refValue.startsWith(Constants.R_TAGS) ? refValue.substring(Constants.R_TAGS.length()) : refValue;
+        String cleanName = refValue.startsWith(Constants.R_TAGS) ? refValue.substring(Constants.R_TAGS.length())
+                : refValue;
         String exactRefPath = Constants.R_TAGS + cleanName;
 
         boolean refExistsOnRemote = remoteRefs.stream()
@@ -358,7 +854,8 @@ public class GitOperationImpl implements GitOperation {
         cloneCommand.call().close();
     }
 
-    private void cloneRepositoryAndCommitCheckout(RepositoryPointer pointer, boolean isEmptyRepo, CloneCommand cloneCommand) throws GitAPIException {
+    private void cloneRepositoryAndCommitCheckout(RepositoryPointer pointer, boolean isEmptyRepo,
+            CloneCommand cloneCommand) throws GitAPIException {
         if (isEmptyRepo) {
             throw new GitOperationException("readRepository",
                     "Cannot checkout a COMMIT because the remote repository is completely empty.");
@@ -440,7 +937,8 @@ public class GitOperationImpl implements GitOperation {
             Path filePath = file.toPath().toAbsolutePath().normalize();
 
             if (!filePath.startsWith(repoPath)) {
-                throw new GitOperationException("addFiles", "File is not within repository directory: " + file.getPath());
+                throw new GitOperationException("addFiles",
+                        "File is not within repository directory: " + file.getPath());
             }
 
             Path relativePath = repoPath.relativize(filePath);
@@ -448,6 +946,38 @@ public class GitOperationImpl implements GitOperation {
         } catch (Exception e) {
             throw new GitOperationException("addFiles", "Failed to get relative path: " + e.getMessage(), e);
         }
+    }
+
+    private void assertSuccessfulRemoteUpdates(String operation, Iterable<PushResult> pushResults) {
+        if (pushResults == null) {
+            return;
+        }
+        for (PushResult pushResult : pushResults) {
+            for (RemoteRefUpdate update : pushResult.getRemoteUpdates()) {
+                RemoteRefUpdate.Status status = update.getStatus();
+                if (status != RemoteRefUpdate.Status.OK && status != RemoteRefUpdate.Status.UP_TO_DATE) {
+                    throw new GitOperationException(operation,
+                            "Remote rejected update for " + update.getRemoteName()
+                                    + ": " + status
+                                    + (StringUtils.hasText(update.getMessage()) ? " (" + update.getMessage() + ")"
+                                            : ""));
+                }
+            }
+        }
+    }
+
+    private String toBareBranchName(String branchName) {
+        if (branchName.startsWith(Constants.R_HEADS)) {
+            return branchName.substring(Constants.R_HEADS.length());
+        }
+        return branchName;
+    }
+
+    private String toBareTagName(String tagName) {
+        if (tagName.startsWith(Constants.R_TAGS)) {
+            return tagName.substring(Constants.R_TAGS.length());
+        }
+        return tagName;
     }
 
     private String toFullBranchRef(String branchName) {

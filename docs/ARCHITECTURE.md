@@ -46,8 +46,8 @@ provider-specific properties and resources while maintaining a common core model
 The git package (`org.opendatamesh.platform.git`) is organized into:
 
 - **`provider/`**: Core provider interfaces and implementations (GitHub, GitLab, Bitbucket, Azure DevOps), and provider-specific credentials. The **factory** that creates provider instances is implemented by the **consuming application** (e.g. registry).
-- **`model/`**: Shared domain models (Repository, Branch, Commit, Tag, User, Organization, RepositoryPointer, etc.)
-- **`git/`**: Low-level Git operations (clone, init, add, commit, push, tag) and credential types for Git transport
+- **`model/`**: Shared domain models (Repository, Branch, Commit, Tag, User, Organization, RepositoryPointer, CreatePullRequest, PullRequest, etc.)
+- **`git/`**: Low-level Git operations (clone, init, add, commit, push, selective branch/tag push, regular and pure-orphan branch creation, local branch merge, tag) and credential types for Git transport
 - **`exceptions/`**: Exception hierarchy for Git and provider failures (see [Exceptions](#exceptions))
 - **`client/`**: Optional REST client utilities and exceptions
 
@@ -58,7 +58,7 @@ All Git-related failures use a common base and are handled consistently at the R
 ### Hierarchy
 
 - **`GitException`** (extends `RuntimeException`) — Base for all git-layer failures. Allows a single catch point or global handling.
-- **`GitOperationException`** — Low-level Git operation failures (clone, init, add, commit, push, tag, getHeadSha). Carries optional `operation` and `details`; typically wraps JGit/IO errors.
+- **`GitOperationException`** — Low-level Git operation failures (clone, init, add, commit, push, pushBranch, pushTag, createAndCheckoutBranch, createAndCheckoutOrphanBranch, mergeBranch, tag, getHeadSha). Carries optional `operation` and `details`; typically wraps JGit/IO errors.
 - **`GitProviderAuthenticationException`** — Thrown when provider API returns 401. Used so the application does not propagate 401 and log out the user.
 - **`GitClientException`** — Provider HTTP API failures (4xx/5xx). Immutable; holds `code` and `responseBody`; supports an optional cause. Message is a readable summary (response body truncated when long).
 - **`GitProviderConfigurationException`** — Invalid or unsupported provider configuration.
@@ -91,8 +91,9 @@ operations that all providers must support:
 - **User Operations**: `getCurrentUser()` - Get authenticated user information
 - **Organization Operations**: `listOrganizations()`, `getOrganization()`, `listMembers()`
 - **Repository Operations**: `listRepositories()`, `getRepository()`, `createRepository()`
+- **Pull Requests**: `createPullRequest(Repository, CreatePullRequest)` — Creates a same-repository Pull Request / Merge Request; caller must push the source branch first (typically via `pushBranch`); returns a `PullRequest` with `id` and `webUrl`
 - **Repository Content**: `listCommits()`, `listBranches()`, `listTags()`
-- **Low-level Git**: `gitOperation()` — Returns a `GitOperation` facade for clone, init, add, commit, push, tag, getHeadSha (uses credentials from the provider)
+- **Low-level Git**: `gitOperation()` — Returns a `GitOperation` facade for clone, init, add, commit, legacy `push` (unchanged), selective `pushBranch` / `pushTag`, regular `createAndCheckoutBranch`, pure `createAndCheckoutOrphanBranch`, local `mergeBranch` (including unrelated histories with conflict rollback), tag, and getHeadSha (uses credentials from the provider)
 
 Additionally, the interface provides an extension point for provider-specific resources:
 

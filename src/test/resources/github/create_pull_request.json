@@ -1,0 +1,13 @@
+{
+  "number": 42,
+  "html_url": "https://github.com/test-org/test-repo/pull/42",
+  "state": "open",
+  "title": "Update v2",
+  "body": "Generated update",
+  "head": {
+    "ref": "update-v2"
+  },
+  "base": {
+    "ref": "main"
+  }
+}

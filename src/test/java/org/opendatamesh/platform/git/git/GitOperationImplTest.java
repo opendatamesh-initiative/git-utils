@@ -2,15 +2,24 @@ package org.opendatamesh.platform.git.git;
 
 import org.eclipse.jgit.api.*;
 import org.eclipse.jgit.api.errors.RefNotFoundException;
+import org.eclipse.jgit.api.errors.TransportException;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.transport.PushResult;
+import org.eclipse.jgit.transport.RefSpec;
+import org.eclipse.jgit.transport.RemoteRefUpdate;
+import org.eclipse.jgit.transport.URIish;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opendatamesh.platform.git.exceptions.GitOperationException;
@@ -84,6 +93,12 @@ class GitOperationImplTest {
 
     @Mock
     private CheckoutCommand checkoutCommand;
+
+    @Mock
+    private CreateBranchCommand createBranchCommand;
+
+    @Mock
+    private StoredConfig storedConfig;
 
     private GitCredentialHttps credential;
     private GitOperationImpl sut;
@@ -593,15 +608,211 @@ class GitOperationImplTest {
         verify(commitCommand).call();
     }
 
-    // --- push ---
+    // --- createAndCheckoutBranch ---
 
-    /**
-     * Scenario: push without tags.
-     * Verifies: push command uses default remote, setPushAll, and no setPushTags.
+    /*
+     * Scenario: BR-001 Create a branch from an attached HEAD
+     *   Given a valid local repository whose current branch points to commit "C1"
+     *   And branch "update-v2" does not exist locally
+     *   And "git ls-remote origin refs/heads/update-v2" returns no matching ref
+     *   When createAndCheckoutBranch is called for "update-v2"
+     *   Then local branch "update-v2" is created at commit "C1"
+     *   And "update-v2" is checked out
+     *   And the returned SHA is the full SHA of commit "C1"
      */
     @Test
-    void whenPushThenCallPushCommand(@TempDir Path tempDir) throws Exception {
-        // Given
+    void br001_createBranchFromAttachedHead(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        String expectedSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        stubCreateAndCheckoutHappyPath(repoDir, expectedSha, Collections.emptyList());
+
+        String sha = sut.createAndCheckoutBranch(repoDir, "update-v2");
+
+        assertThat(sha).isEqualTo(expectedSha);
+        verify(createBranchCommand).setName("update-v2");
+        verify(createBranchCommand).call();
+        verify(checkoutCommand).setName("update-v2");
+        verify(checkoutCommand).call();
+        verify(gitFactory).lsRemoteRepository();
+    }
+
+    /*
+     * Scenario: BR-002 Create a branch from a detached HEAD
+     *   Given a valid local repository with detached HEAD at commit "C1"
+     *   And branch "update-v2" does not exist locally or on origin
+     *   When createAndCheckoutBranch is called for "update-v2"
+     *   Then local branch "update-v2" is created at commit "C1"
+     *   And "update-v2" is checked out
+     *   And the returned SHA is the full SHA of commit "C1"
+     */
+    @Test
+    void br002_createBranchFromDetachedHead(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        String expectedSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        stubCreateAndCheckoutHappyPath(repoDir, expectedSha, Collections.emptyList());
+
+        String sha = sut.createAndCheckoutBranch(repoDir, "update-v2");
+
+        assertThat(sha).isEqualTo(expectedSha);
+        verify(createBranchCommand).call();
+        verify(checkoutCommand).call();
+    }
+
+    /*
+     * Scenario: BR-003 Refuse a branch name that exists locally
+     *   Given a valid local repository
+     *   And local branch "update-v2" already exists
+     *   When createAndCheckoutBranch is called for "update-v2"
+     *   Then a GitOperationException with operation "createAndCheckoutBranch" is thrown
+     *   And git ls-remote is not called
+     *   And no branch is created or checked out
+     */
+    @Test
+    void br003_refuseBranchThatExistsLocally(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        ObjectId existing = mock(ObjectId.class);
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_HEADS + "update-v2")).thenReturn(existing);
+
+        assertThatThrownBy(() -> sut.createAndCheckoutBranch(repoDir, "update-v2"))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("createAndCheckoutBranch")
+                .hasMessageContaining("already exists locally");
+
+        verify(gitFactory, never()).lsRemoteRepository();
+        verify(git, never()).branchCreate();
+        verify(git, never()).checkout();
+    }
+
+    /*
+     * Scenario: BR-004 Refuse a branch name that exists on origin
+     *   Given a valid local repository without local branch "update-v2"
+     *   And "git ls-remote origin refs/heads/update-v2" returns that exact remote ref
+     *   When createAndCheckoutBranch is called for "update-v2"
+     *   Then a GitOperationException with operation "createAndCheckoutBranch" is thrown
+     *   And no branch is created or checked out
+     */
+    @Test
+    void br004_refuseBranchThatExistsOnOrigin(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        Ref remoteRef = mock(Ref.class);
+        when(remoteRef.getName()).thenReturn(Constants.R_HEADS + "update-v2");
+
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_HEADS + "update-v2")).thenReturn(null);
+        when(jgitRepository.getConfig()).thenReturn(storedConfig);
+        when(storedConfig.getString("remote", Constants.DEFAULT_REMOTE_NAME, "url"))
+                .thenReturn(REMOTE_URL);
+        when(gitFactory.lsRemoteRepository()).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setRemote(anyString())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setCredentialsProvider(any())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.call()).thenReturn(List.of(remoteRef));
+
+        assertThatThrownBy(() -> sut.createAndCheckoutBranch(repoDir, "update-v2"))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("createAndCheckoutBranch")
+                .hasMessageContaining("already exists on origin");
+
+        verify(git, never()).branchCreate();
+        verify(git, never()).checkout();
+    }
+
+    /*
+     * Scenario: BR-005 Surface a remote existence check failure
+     *   Given a valid local repository without local branch "update-v2"
+     *   And authenticated git ls-remote fails
+     *   When createAndCheckoutBranch is called for "update-v2"
+     *   Then a GitOperationException with operation "createAndCheckoutBranch" wraps the failure
+     *   And no branch is created or checked out
+     */
+    @Test
+    void br005_surfaceRemoteExistenceCheckFailure(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_HEADS + "update-v2")).thenReturn(null);
+        when(jgitRepository.getConfig()).thenReturn(storedConfig);
+        when(storedConfig.getString("remote", Constants.DEFAULT_REMOTE_NAME, "url"))
+                .thenReturn(REMOTE_URL);
+        when(gitFactory.lsRemoteRepository()).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setRemote(anyString())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setCredentialsProvider(any())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.call()).thenThrow(new TransportException("ls-remote failed"));
+
+        assertThatThrownBy(() -> sut.createAndCheckoutBranch(repoDir, "update-v2"))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("createAndCheckoutBranch")
+                .hasMessageContaining("Failed to check remote branch existence")
+                .hasCauseInstanceOf(TransportException.class);
+
+        verify(git, never()).branchCreate();
+        verify(git, never()).checkout();
+    }
+
+    /*
+     * Scenario Outline: BR-006 Reject invalid branch creation input
+     *   Given <repository condition>
+     *   And the requested branch name is <branch name>
+     *   When createAndCheckoutBranch is called
+     *   Then a GitOperationException with operation "createAndCheckoutBranch" is thrown
+     *   And no Git mutation is attempted
+     *
+     *   Examples:
+     *     | repository condition                    | branch name |
+     *     | the repository directory is null        | "update-v2" |
+     *     | the repository directory does not exist | "update-v2" |
+     *     | the repository directory is valid       | blank       |
+     *     | the repository has no origin URL         | "update-v2" |
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "nullDir, update-v2",
+            "missingDir, update-v2",
+            "validDir, ",
+            "noOrigin, update-v2"
+    })
+    void br006_rejectInvalidBranchCreationInput(String repositoryCondition, String branchName, @TempDir Path tempDir)
+            throws Exception {
+        File repoDir;
+        if ("nullDir".equals(repositoryCondition)) {
+            repoDir = null;
+        } else if ("missingDir".equals(repositoryCondition)) {
+            repoDir = tempDir.resolve("missing").toFile();
+        } else if ("noOrigin".equals(repositoryCondition)) {
+            repoDir = tempDir.toFile();
+            when(gitFactory.open(repoDir)).thenReturn(git);
+            when(git.getRepository()).thenReturn(jgitRepository);
+            when(jgitRepository.resolve(anyString())).thenReturn(null);
+            when(jgitRepository.getConfig()).thenReturn(storedConfig);
+            when(storedConfig.getString("remote", Constants.DEFAULT_REMOTE_NAME, "url")).thenReturn(null);
+        } else {
+            // validDir with blank branch name — fails before opening the repository
+            repoDir = tempDir.toFile();
+        }
+
+        File finalRepoDir = repoDir;
+        assertThatThrownBy(() -> sut.createAndCheckoutBranch(finalRepoDir, branchName))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("createAndCheckoutBranch");
+
+        verify(git, never()).branchCreate();
+        verify(gitFactory, never()).lsRemoteRepository();
+    }
+
+    // --- push / pushBranch / pushTag ---
+
+    /*
+     * Scenario: PUSH-001 Preserve legacy branch push behavior
+     *   Given a valid local repository
+     *   When push is called with pushTags false
+     *   Then the existing push-all-branches behavior is used
+     *   And tags are not pushed
+     *   And no selective refspec is configured
+     */
+    @Test
+    void push001_preserveLegacyBranchPushBehavior(@TempDir Path tempDir) throws Exception {
         File repoDir = tempDir.toFile();
         when(gitFactory.open(repoDir)).thenReturn(git);
         when(git.push()).thenReturn(pushCommand);
@@ -609,24 +820,27 @@ class GitOperationImplTest {
         when(pushCommand.setCredentialsProvider(any())).thenReturn(pushCommand);
         when(pushCommand.setPushAll()).thenReturn(pushCommand);
 
-        // When
         sut.push(repoDir, false);
 
-        // Then
         verify(gitFactory).open(repoDir);
         verify(git).push();
         verify(pushCommand).setRemote(Constants.DEFAULT_REMOTE_NAME);
         verify(pushCommand).setPushAll();
+        verify(pushCommand, never()).setRefSpecs(any(RefSpec.class));
+        verify(pushCommand, never()).setPushTags();
         verify(pushCommand).call();
     }
 
-    /**
-     * Scenario: push with tags (pushTags=true).
-     * Verifies: setPushTags() is invoked on the push command.
+    /*
+     * Scenario: PUSH-002 Preserve legacy optional tag push behavior
+     *   Given a valid local repository
+     *   When push is called with pushTags true
+     *   Then the existing push-all-branches behavior is used
+     *   And the existing push-all-tags behavior is also used
+     *   And no selective refspec is configured
      */
     @Test
-    void whenPushWithTagsThenSetPushTags(@TempDir Path tempDir) throws Exception {
-        // Given
+    void push002_preserveLegacyOptionalTagPushBehavior(@TempDir Path tempDir) throws Exception {
         File repoDir = tempDir.toFile();
         when(gitFactory.open(repoDir)).thenReturn(git);
         when(git.push()).thenReturn(pushCommand);
@@ -635,12 +849,514 @@ class GitOperationImplTest {
         when(pushCommand.setPushAll()).thenReturn(pushCommand);
         when(pushCommand.setPushTags()).thenReturn(pushCommand);
 
-        // When
         sut.push(repoDir, true);
 
-        // Then
+        verify(pushCommand).setPushAll();
         verify(pushCommand).setPushTags();
+        verify(pushCommand, never()).setRefSpecs(any(RefSpec.class));
         verify(pushCommand).call();
+    }
+
+    /*
+     * Scenario: PUSH-003 Selectively publish one named branch
+     *   Given a valid local repository containing branches "main" and "update-v2"
+     *   And HEAD is not required to point to "update-v2"
+     *   When pushBranch is called for "update-v2"
+     *   Then exactly one non-force refspec pushes "refs/heads/update-v2" to "refs/heads/update-v2" on origin
+     *   And "main" is not pushed
+     *   And no tags are pushed
+     *   And the matching remote update is successful or up to date
+     */
+    @Test
+    void push003_selectivelyPublishOneNamedBranch(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        ObjectId branchId = mock(ObjectId.class);
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_HEADS + "update-v2")).thenReturn(branchId);
+        when(git.push()).thenReturn(pushCommand);
+        when(pushCommand.setRemote(anyString())).thenReturn(pushCommand);
+        when(pushCommand.setCredentialsProvider(any())).thenReturn(pushCommand);
+        when(pushCommand.setRefSpecs(any(RefSpec.class))).thenReturn(pushCommand);
+        stubSuccessfulRemoteUpdate(RemoteRefUpdate.Status.OK);
+
+        sut.pushBranch(repoDir, "update-v2");
+
+        ArgumentCaptor<RefSpec> refSpecCaptor = ArgumentCaptor.forClass(RefSpec.class);
+        verify(pushCommand).setRemote(Constants.DEFAULT_REMOTE_NAME);
+        verify(pushCommand).setRefSpecs(refSpecCaptor.capture());
+        assertThat(refSpecCaptor.getValue().toString()).isEqualTo("refs/heads/update-v2:refs/heads/update-v2");
+        assertThat(refSpecCaptor.getValue().isForceUpdate()).isFalse();
+        verify(pushCommand, never()).setPushAll();
+        verify(pushCommand, never()).setPushTags();
+        verify(pushCommand).call();
+    }
+
+    /*
+     * Scenario: PUSH-004 Surface a rejected selective branch update
+     *   Given a valid local repository containing branch "update-v2"
+     *   And origin rejects "refs/heads/update-v2" as non-fast-forward
+     *   When pushBranch is called for "update-v2"
+     *   Then a GitOperationException with operation "pushBranch" describes the rejected update
+     *   And the rejection is not reported as success
+     */
+    @Test
+    void push004_surfaceRejectedSelectiveBranchUpdate(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        ObjectId branchId = mock(ObjectId.class);
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_HEADS + "update-v2")).thenReturn(branchId);
+        when(git.push()).thenReturn(pushCommand);
+        when(pushCommand.setRemote(anyString())).thenReturn(pushCommand);
+        when(pushCommand.setCredentialsProvider(any())).thenReturn(pushCommand);
+        when(pushCommand.setRefSpecs(any(RefSpec.class))).thenReturn(pushCommand);
+
+        RemoteRefUpdate update = mock(RemoteRefUpdate.class);
+        when(update.getStatus()).thenReturn(RemoteRefUpdate.Status.REJECTED_NONFASTFORWARD);
+        when(update.getRemoteName()).thenReturn("refs/heads/update-v2");
+        when(update.getMessage()).thenReturn("non-fast-forward");
+        PushResult pushResult = mock(PushResult.class);
+        when(pushResult.getRemoteUpdates()).thenReturn(List.of(update));
+        when(pushCommand.call()).thenReturn(List.of(pushResult));
+
+        assertThatThrownBy(() -> sut.pushBranch(repoDir, "update-v2"))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("pushBranch")
+                .hasMessageContaining("REJECTED_NONFASTFORWARD");
+    }
+
+    /*
+     * Scenario: PUSH-005 Publish only a selected branch to a real bare remote
+     *   Given a real local repository connected to a real bare origin
+     *   And local branches "main" and "update-v2" both have unpushed commits
+     *   When pushBranch is called for "update-v2"
+     *   Then origin contains "refs/heads/update-v2" at the local "update-v2" tip
+     *   And the unpushed "main" commit is not published
+     *   And no tag is published
+     */
+    @Test
+    void push005_publishOnlySelectedBranchToRealBareRemote(@TempDir Path tempDir) throws Exception {
+        Path barePath = tempDir.resolve("origin.git");
+        Path localPath = tempDir.resolve("local");
+        Files.createDirectories(localPath);
+
+        Git.init().setDirectory(barePath.toFile()).setBare(true).call().close();
+
+        String updateV2Head;
+        String mainHeadBeforeExtraCommit;
+        try (Git local = Git.init().setDirectory(localPath.toFile()).setInitialBranch("main").call()) {
+            Files.writeString(localPath.resolve("README.md"), "hello");
+            local.add().addFilepattern("README.md").call();
+            local.commit().setMessage("init").call();
+            local.remoteAdd().setName(Constants.DEFAULT_REMOTE_NAME)
+                    .setUri(new URIish(barePath.toUri().toString()))
+                    .call();
+            local.push().setRemote(Constants.DEFAULT_REMOTE_NAME)
+                    .setRefSpecs(new RefSpec("refs/heads/main:refs/heads/main"))
+                    .call();
+            mainHeadBeforeExtraCommit = local.getRepository().resolve(Constants.R_HEADS + "main").getName();
+
+            local.branchCreate().setName("update-v2").call();
+            local.checkout().setName("update-v2").call();
+            Files.writeString(localPath.resolve("change.txt"), "update");
+            local.add().addFilepattern("change.txt").call();
+            local.commit().setMessage("update").call();
+            updateV2Head = local.getRepository().resolve(Constants.R_HEADS + "update-v2").getName();
+
+            local.checkout().setName("main").call();
+            Files.writeString(localPath.resolve("main-only.txt"), "main-extra");
+            local.add().addFilepattern("main-only.txt").call();
+            local.commit().setMessage("main-extra").call();
+        }
+
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        realSut.pushBranch(localPath.toFile(), "update-v2");
+
+        try (Git bare = Git.open(barePath.toFile())) {
+            Ref remoteUpdate = bare.getRepository().exactRef(Constants.R_HEADS + "update-v2");
+            assertThat(remoteUpdate).isNotNull();
+            assertThat(remoteUpdate.getObjectId().getName()).isEqualTo(updateV2Head);
+
+            Ref remoteMain = bare.getRepository().exactRef(Constants.R_HEADS + "main");
+            assertThat(remoteMain).isNotNull();
+            assertThat(remoteMain.getObjectId().getName()).isEqualTo(mainHeadBeforeExtraCommit);
+
+            assertThat(bare.getRepository().exactRef(Constants.R_TAGS + "checkpoint-v2")).isNull();
+        }
+    }
+
+    /*
+     * Scenario: PUSH-006 Selectively publish one named tag
+     *   Given a valid local repository containing tags "checkpoint-v1" and "checkpoint-v2"
+     *   When pushTag is called for "checkpoint-v2"
+     *   Then exactly one non-force refspec pushes "refs/tags/checkpoint-v2" to "refs/tags/checkpoint-v2" on origin
+     *   And "checkpoint-v1" is not pushed
+     *   And no branch is pushed
+     *   And the matching remote update is successful or up to date
+     */
+    @Test
+    void push006_selectivelyPublishOneNamedTag(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        ObjectId tagId = mock(ObjectId.class);
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_TAGS + "checkpoint-v2")).thenReturn(tagId);
+        when(git.push()).thenReturn(pushCommand);
+        when(pushCommand.setRemote(anyString())).thenReturn(pushCommand);
+        when(pushCommand.setCredentialsProvider(any())).thenReturn(pushCommand);
+        when(pushCommand.setRefSpecs(any(RefSpec.class))).thenReturn(pushCommand);
+        stubSuccessfulRemoteUpdate(RemoteRefUpdate.Status.OK);
+
+        sut.pushTag(repoDir, "checkpoint-v2");
+
+        ArgumentCaptor<RefSpec> refSpecCaptor = ArgumentCaptor.forClass(RefSpec.class);
+        verify(pushCommand).setRemote(Constants.DEFAULT_REMOTE_NAME);
+        verify(pushCommand).setRefSpecs(refSpecCaptor.capture());
+        assertThat(refSpecCaptor.getValue().toString()).isEqualTo("refs/tags/checkpoint-v2:refs/tags/checkpoint-v2");
+        assertThat(refSpecCaptor.getValue().isForceUpdate()).isFalse();
+        verify(pushCommand, never()).setPushAll();
+        verify(pushCommand, never()).setPushTags();
+        verify(pushCommand).call();
+    }
+
+    /*
+     * Scenario: PUSH-007 Surface a rejected selective tag update
+     *   Given a valid local repository containing tag "checkpoint-v2"
+     *   And origin rejects "refs/tags/checkpoint-v2"
+     *   When pushTag is called for "checkpoint-v2"
+     *   Then a GitOperationException with operation "pushTag" describes the rejected update
+     *   And the rejection is not reported as success
+     */
+    @Test
+    void push007_surfaceRejectedSelectiveTagUpdate(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        ObjectId tagId = mock(ObjectId.class);
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_TAGS + "checkpoint-v2")).thenReturn(tagId);
+        when(git.push()).thenReturn(pushCommand);
+        when(pushCommand.setRemote(anyString())).thenReturn(pushCommand);
+        when(pushCommand.setCredentialsProvider(any())).thenReturn(pushCommand);
+        when(pushCommand.setRefSpecs(any(RefSpec.class))).thenReturn(pushCommand);
+
+        RemoteRefUpdate update = mock(RemoteRefUpdate.class);
+        when(update.getStatus()).thenReturn(RemoteRefUpdate.Status.REJECTED_OTHER_REASON);
+        when(update.getRemoteName()).thenReturn("refs/tags/checkpoint-v2");
+        when(update.getMessage()).thenReturn("rejected");
+        PushResult pushResult = mock(PushResult.class);
+        when(pushResult.getRemoteUpdates()).thenReturn(List.of(update));
+        when(pushCommand.call()).thenReturn(List.of(pushResult));
+
+        assertThatThrownBy(() -> sut.pushTag(repoDir, "checkpoint-v2"))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("pushTag")
+                .hasMessageContaining("REJECTED_OTHER_REASON");
+    }
+
+    /*
+     * Scenario: PUSH-008 Publish only a selected tag to a real bare remote
+     *   Given a real local repository connected to a real bare origin
+     *   And local tags "checkpoint-v1" and "checkpoint-v2" are not on origin
+     *   And a local branch has an unpushed commit
+     *   When pushTag is called for "checkpoint-v2"
+     *   Then origin contains "refs/tags/checkpoint-v2" at the local tag target
+     *   And "refs/tags/checkpoint-v1" is absent from origin
+     *   And the unpushed branch commit is not published
+     */
+    @Test
+    void push008_publishOnlySelectedTagToRealBareRemote(@TempDir Path tempDir) throws Exception {
+        Path barePath = tempDir.resolve("origin.git");
+        Path localPath = tempDir.resolve("local");
+        Files.createDirectories(localPath);
+
+        Git.init().setDirectory(barePath.toFile()).setBare(true).call().close();
+
+        String checkpointV2Target;
+        String mainHeadOnOrigin;
+        try (Git local = Git.init().setDirectory(localPath.toFile()).setInitialBranch("main").call()) {
+            Files.writeString(localPath.resolve("README.md"), "hello");
+            local.add().addFilepattern("README.md").call();
+            RevCommit first = local.commit().setMessage("init").call();
+            local.tag().setName("checkpoint-v1").setObjectId(first).call();
+
+            local.remoteAdd().setName(Constants.DEFAULT_REMOTE_NAME)
+                    .setUri(new URIish(barePath.toUri().toString()))
+                    .call();
+            local.push().setRemote(Constants.DEFAULT_REMOTE_NAME)
+                    .setRefSpecs(new RefSpec("refs/heads/main:refs/heads/main"))
+                    .call();
+            mainHeadOnOrigin = local.getRepository().resolve(Constants.R_HEADS + "main").getName();
+
+            Files.writeString(localPath.resolve("next.txt"), "next");
+            local.add().addFilepattern("next.txt").call();
+            RevCommit second = local.commit().setMessage("next").call();
+            local.tag().setName("checkpoint-v2").setObjectId(second).call();
+            checkpointV2Target = second.getName();
+        }
+
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        realSut.pushTag(localPath.toFile(), "checkpoint-v2");
+
+        try (Git bare = Git.open(barePath.toFile())) {
+            Ref remoteTag = bare.getRepository().exactRef(Constants.R_TAGS + "checkpoint-v2");
+            assertThat(remoteTag).isNotNull();
+            Ref peeled = bare.getRepository().getRefDatabase().peel(remoteTag);
+            ObjectId tagTarget = peeled.getPeeledObjectId() != null ? peeled.getPeeledObjectId() : peeled.getObjectId();
+            assertThat(tagTarget.getName()).isEqualTo(checkpointV2Target);
+            assertThat(bare.getRepository().exactRef(Constants.R_TAGS + "checkpoint-v1")).isNull();
+
+            Ref remoteMain = bare.getRepository().exactRef(Constants.R_HEADS + "main");
+            assertThat(remoteMain).isNotNull();
+            assertThat(remoteMain.getObjectId().getName()).isEqualTo(mainHeadOnOrigin);
+        }
+    }
+
+    /*
+     * Scenario Outline: PUSH-009 Reject invalid selective push input
+     *   Given <repository condition>
+     *   And the requested <ref type> name is <ref name>
+     *   When the selective push method is called
+     *   Then a GitOperationException with operation <operation> is thrown
+     *   And no push command is executed
+     *
+     *   Examples:
+     *     | repository condition                    | ref type | ref name       | operation    |
+     *     | the repository directory is null        | branch   | "update-v2"    | "pushBranch" |
+     *     | the repository directory does not exist | branch   | "update-v2"    | "pushBranch" |
+     *     | the repository directory is valid       | branch   | blank           | "pushBranch" |
+     *     | the local branch does not exist          | branch   | "update-v2"    | "pushBranch" |
+     *     | the repository directory is null        | tag      | "checkpoint-v2"| "pushTag"    |
+     *     | the repository directory does not exist | tag      | "checkpoint-v2"| "pushTag"    |
+     *     | the repository directory is valid       | tag      | blank           | "pushTag"    |
+     *     | the local tag does not exist             | tag      | "checkpoint-v2"| "pushTag"    |
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "nullDir, branch, update-v2, pushBranch",
+            "missingDir, branch, update-v2, pushBranch",
+            "validDir, branch, , pushBranch",
+            "missingRef, branch, update-v2, pushBranch",
+            "nullDir, tag, checkpoint-v2, pushTag",
+            "missingDir, tag, checkpoint-v2, pushTag",
+            "validDir, tag, , pushTag",
+            "missingRef, tag, checkpoint-v2, pushTag"
+    })
+    void push009_rejectInvalidSelectivePushInput(String repositoryCondition, String refType, String refName,
+                                                 String operation, @TempDir Path tempDir) throws Exception {
+        File repoDir;
+        if ("nullDir".equals(repositoryCondition)) {
+            repoDir = null;
+        } else if ("missingDir".equals(repositoryCondition)) {
+            repoDir = tempDir.resolve("missing").toFile();
+        } else if ("missingRef".equals(repositoryCondition)) {
+            repoDir = tempDir.toFile();
+            when(gitFactory.open(repoDir)).thenReturn(git);
+            when(git.getRepository()).thenReturn(jgitRepository);
+            when(jgitRepository.resolve(anyString())).thenReturn(null);
+        } else {
+            repoDir = tempDir.toFile();
+        }
+
+        File finalRepoDir = repoDir;
+        if ("branch".equals(refType)) {
+            assertThatThrownBy(() -> sut.pushBranch(finalRepoDir, refName))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining(operation);
+        } else {
+            assertThatThrownBy(() -> sut.pushTag(finalRepoDir, refName))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining(operation);
+        }
+
+        verify(git, never()).push();
+    }
+
+    // --- pure orphan branches and local merges ---
+
+    /**
+     * ORPH-001, ORPH-002: a pure orphan is unborn and contains no inherited
+     * index or work-tree entries; its first commit is parentless.
+     */
+    @Test
+    void orph001_createPureOrphanWithParentlessFirstCommit(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            Files.writeString(repoDir.toPath().resolve("inherited.txt"), "main");
+            commitAll(local, "main");
+
+            realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1");
+
+            assertThat(local.getRepository().getFullBranch()).isEqualTo(Constants.R_HEADS + "pure-v1");
+            assertThat(local.getRepository().resolve(Constants.HEAD)).isNull();
+            assertThat(local.getRepository().readDirCache().getEntryCount()).isZero();
+            try (var children = Files.list(repoDir.toPath())) {
+                assertThat(children.map(path -> path.getFileName().toString()))
+                        .containsExactly(".git");
+            }
+
+            Files.writeString(repoDir.toPath().resolve("generated.txt"), "generated");
+            commitAll(local, "first orphan commit");
+            try (RevWalk walk = new RevWalk(local.getRepository())) {
+                RevCommit first = walk.parseCommit(local.getRepository().resolve(Constants.HEAD));
+                assertThat(first.getParentCount()).isZero();
+            }
+        }
+    }
+
+    /**
+     * ORPH-003, ORPH-004, ORPH-005: invalid input, collisions, and dirty or
+     * ignored content are rejected without changing HEAD.
+     */
+    @Test
+    void orph003_rejectInvalidOrUnsafeCreationWithoutMutation(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            Files.writeString(repoDir.toPath().resolve("tracked.txt"), "main");
+            commitAll(local, "main");
+            ObjectId originalHead = local.getRepository().resolve(Constants.HEAD);
+
+            assertThatThrownBy(() -> realSut.createAndCheckoutOrphanBranch(repoDir, "main"))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining("already exists locally");
+            assertThat(local.getRepository().resolve(Constants.HEAD)).isEqualTo(originalHead);
+
+            Files.writeString(repoDir.toPath().resolve("untracked.txt"), "unsafe");
+            assertThatThrownBy(() -> realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1"))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining("pristine");
+            assertThat(local.getRepository().resolve(Constants.HEAD)).isEqualTo(originalHead);
+        }
+    }
+
+    /**
+     * MERGE-001 and MERGE-005: unrelated histories produce a local two-parent
+     * merge commit preserving files from both trees.
+     */
+    @Test
+    void merge001_mergeUnrelatedHistoriesWithOrderedParents(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            Files.writeString(repoDir.toPath().resolve("user.txt"), "user");
+            commitAll(local, "main");
+            ObjectId mainTip = local.getRepository().resolve(Constants.HEAD);
+
+            realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1");
+            Files.writeString(repoDir.toPath().resolve("generated.txt"), "generated");
+            commitAll(local, "pure");
+            ObjectId sourceTip = local.getRepository().resolve(Constants.HEAD);
+            local.checkout().setName("main").call();
+
+            String result = realSut.mergeBranch(repoDir, "pure-v1", "main");
+
+            assertThat(local.getRepository().getBranch()).isEqualTo("main");
+            assertThat(repoDir.toPath().resolve("user.txt")).hasContent("user");
+            assertThat(repoDir.toPath().resolve("generated.txt")).hasContent("generated");
+            try (RevWalk walk = new RevWalk(local.getRepository())) {
+                RevCommit mergeCommit = walk.parseCommit(ObjectId.fromString(result));
+                assertThat(mergeCommit.getParentCount()).isEqualTo(2);
+                assertThat(mergeCommit.getParent(0).getId()).isEqualTo(mainTip);
+                assertThat(mergeCommit.getParent(1).getId()).isEqualTo(sourceTip);
+                assertThat(mergeCommit.getFullMessage())
+                        .isEqualTo("Merge branch 'pure-v1' into 'main'");
+            }
+        }
+    }
+
+    /**
+     * MERGE-002: an unrelated add/add conflict restores the exact target tip and
+     * clears all conflict and merge metadata.
+     */
+    @Test
+    void merge002_rollBackConflictingUnrelatedMerge(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            Files.writeString(repoDir.toPath().resolve("same.txt"), "target");
+            commitAll(local, "main");
+            ObjectId mainTip = local.getRepository().resolve(Constants.HEAD);
+
+            realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1");
+            Files.writeString(repoDir.toPath().resolve("same.txt"), "source");
+            commitAll(local, "pure");
+            local.checkout().setName("main").call();
+
+            assertThatThrownBy(() -> realSut.mergeBranch(repoDir, "pure-v1", "main"))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining("mergeBranch");
+
+            assertThat(local.getRepository().getBranch()).isEqualTo("main");
+            assertThat(local.getRepository().resolve(Constants.HEAD)).isEqualTo(mainTip);
+            assertThat(local.status().call().isClean()).isTrue();
+            assertThat(local.getRepository().getRepositoryState()).isEqualTo(
+                    org.eclipse.jgit.lib.RepositoryState.SAFE);
+            assertThat(repoDir.toPath().resolve("same.txt")).hasContent("target");
+        }
+    }
+
+    /**
+     * MERGE-003 and MERGE-004: related histories use normal merge semantics and
+     * invalid local branch input does not mutate the repository.
+     */
+    @Test
+    void merge003_mergeRelatedHistoryAndRejectMissingBranch(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            Files.writeString(repoDir.toPath().resolve("base.txt"), "base");
+            commitAll(local, "base");
+            local.branchCreate().setName("feature").call();
+            local.checkout().setName("feature").call();
+            Files.writeString(repoDir.toPath().resolve("feature.txt"), "feature");
+            commitAll(local, "feature");
+            ObjectId featureTip = local.getRepository().resolve(Constants.HEAD);
+            local.checkout().setName("main").call();
+
+            assertThat(realSut.mergeBranch(repoDir, "feature", "main"))
+                    .isEqualTo(featureTip.getName());
+            assertThat(repoDir.toPath().resolve("feature.txt")).hasContent("feature");
+
+            ObjectId currentTip = local.getRepository().resolve(Constants.HEAD);
+            assertThatThrownBy(() -> realSut.mergeBranch(repoDir, "missing", "main"))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining("does not exist");
+            assertThat(local.getRepository().resolve(Constants.HEAD)).isEqualTo(currentTip);
+        }
+    }
+
+    /**
+     * FLOW-001: orphan creation, first commit, tag creation, and unrelated merge
+     * compose without hidden remote side effects.
+     */
+    @Test
+    void flow001_composeOrphanTagAndMerge(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            Files.writeString(repoDir.toPath().resolve("main.txt"), "main");
+            commitAll(local, "main");
+
+            realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1");
+            Files.writeString(repoDir.toPath().resolve("pure.txt"), "pure");
+            commitAll(local, "pure");
+            String pureTip = local.getRepository().resolve(Constants.HEAD).getName();
+            realSut.addTag(repoDir,
+                    new org.opendatamesh.platform.git.model.Tag("checkpoint-v1", pureTip));
+            local.checkout().setName("main").call();
+
+            String mergeTip = realSut.mergeBranch(repoDir, "pure-v1", "main");
+
+            Ref tag = local.getRepository().exactRef(Constants.R_TAGS + "checkpoint-v1");
+            Ref peeled = local.getRepository().getRefDatabase().peel(tag);
+            ObjectId tagTarget = peeled.getPeeledObjectId() == null
+                    ? peeled.getObjectId() : peeled.getPeeledObjectId();
+            assertThat(tagTarget.getName()).isEqualTo(pureTip);
+            assertThat(local.getRepository().resolve(Constants.R_HEADS + "main").getName())
+                    .isEqualTo(mergeTip);
+        }
     }
 
     // --- getHeadSha ---
@@ -751,6 +1467,56 @@ class GitOperationImplTest {
     }
 
     // --- Helpers ---
+
+    private void stubCreateAndCheckoutHappyPath(File repoDir, String expectedSha, Collection<Ref> remoteRefs)
+            throws Exception {
+        ObjectId headId = mock(ObjectId.class);
+        when(headId.getName()).thenReturn(expectedSha);
+
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.R_HEADS + "update-v2")).thenReturn(null);
+        when(jgitRepository.getConfig()).thenReturn(storedConfig);
+        when(storedConfig.getString("remote", Constants.DEFAULT_REMOTE_NAME, "url")).thenReturn(REMOTE_URL);
+        when(gitFactory.lsRemoteRepository()).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setRemote(anyString())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.setCredentialsProvider(any())).thenReturn(lsRemoteCommand);
+        when(lsRemoteCommand.call()).thenReturn(remoteRefs);
+        when(git.branchCreate()).thenReturn(createBranchCommand);
+        when(createBranchCommand.setName("update-v2")).thenReturn(createBranchCommand);
+        when(git.checkout()).thenReturn(checkoutCommand);
+        when(checkoutCommand.setName("update-v2")).thenReturn(checkoutCommand);
+        when(jgitRepository.resolve(Constants.HEAD)).thenReturn(headId);
+    }
+
+    private void stubSuccessfulRemoteUpdate(RemoteRefUpdate.Status status) throws Exception {
+        RemoteRefUpdate update = mock(RemoteRefUpdate.class);
+        when(update.getStatus()).thenReturn(status);
+        PushResult pushResult = mock(PushResult.class);
+        when(pushResult.getRemoteUpdates()).thenReturn(List.of(update));
+        when(pushCommand.call()).thenReturn(List.of(pushResult));
+    }
+
+    private Git initializeRepositoryWithOrigin(File repoDir, Path bareRemote) throws Exception {
+        try (Git ignored = Git.init().setBare(true).setDirectory(bareRemote.toFile()).call()) {
+            // The bare repository only provides a real local origin for ls-remote.
+        }
+        Git local = Git.init().setInitialBranch("main").setDirectory(repoDir).call();
+        StoredConfig config = local.getRepository().getConfig();
+        config.setString("user", null, "name", "Test User");
+        config.setString("user", null, "email", "test@example.com");
+        config.save();
+        local.remoteAdd()
+                .setName(Constants.DEFAULT_REMOTE_NAME)
+                .setUri(new URIish(bareRemote.toUri().toString()))
+                .call();
+        return local;
+    }
+
+    private void commitAll(Git local, String message) throws Exception {
+        local.add().addFilepattern(".").call();
+        local.commit().setMessage(message).call();
+    }
 
     private static org.opendatamesh.platform.git.model.Repository validRepository() {
         org.opendatamesh.platform.git.model.Repository repo = new org.opendatamesh.platform.git.model.Repository();
