@@ -1299,7 +1299,7 @@ class GitOperationImplTest {
 
     /**
      * MERGE-003 and MERGE-004: related histories use normal merge semantics and
-     * invalid local branch input does not mutate the repository.
+     * invalid local branch input (missing or unborn source) does not mutate the repository.
      */
     @Test
     void merge003_mergeRelatedHistoryAndRejectMissingBranch(@TempDir Path tempDir) throws Exception {
@@ -1324,12 +1324,29 @@ class GitOperationImplTest {
                     .isInstanceOf(GitOperationException.class)
                     .hasMessageContaining("does not exist");
             assertThat(local.getRepository().resolve(Constants.HEAD)).isEqualTo(currentTip);
+
+            realSut.createAndCheckoutOrphanBranch(repoDir, "unborn-source");
+            assertThatThrownBy(() -> realSut.mergeBranch(repoDir, "unborn-source", "main"))
+                    .isInstanceOf(GitOperationException.class)
+                    .hasMessageContaining("unborn");
+            assertThat(local.getRepository().resolve(Constants.R_HEADS + "main")).isEqualTo(currentTip);
         }
     }
 
     /**
      * FLOW-001: orphan creation, first commit, tag creation, and unrelated merge
      * compose without hidden remote side effects.
+     *
+     * <pre>
+     * Scenario: FLOW-001 Tag the pure commit and merge it into a branch with existing files
+     *   Given branch "main" contains committed file "user.txt"
+     *   And orphan branch "pure-v1" contains only committed file "generated.txt"
+     *   When the pure commit is tagged "checkpoint-v1"
+     *   And mergeBranch merges "pure-v1" into "main"
+     *   Then tag "checkpoint-v1" still points to the pure commit containing only "generated.txt"
+     *   And "main" contains both "user.txt" and "generated.txt"
+     *   And the orphan branch has not been pushed
+     * </pre>
      */
     @Test
     void flow001_composeOrphanTagAndMerge(@TempDir Path tempDir) throws Exception {
@@ -1356,6 +1373,103 @@ class GitOperationImplTest {
             assertThat(tagTarget.getName()).isEqualTo(pureTip);
             assertThat(local.getRepository().resolve(Constants.R_HEADS + "main").getName())
                     .isEqualTo(mergeTip);
+        }
+    }
+
+    /**
+     * MERGE-006: missing or unborn target is tip-promoted to the source tip with no
+     * merge commit.
+     *
+     * <pre>
+     * Scenario: MERGE-006 Tip-promote when the target branch is missing or unborn
+     *   Given orphan source branch "pure-v1" at commit "P1" containing "generated.txt"
+     *   And target branch "main" has no resolved tip
+     *   And the repository work tree is clean
+     *   When mergeBranch merges "pure-v1" into "main"
+     *   Then "main" is checked out at commit "P1"
+     *   And the returned SHA equals the full SHA of "P1"
+     *   And "main" contains "generated.txt"
+     *   And no merge commit is created
+     *   And neither branch is pushed or deleted
+     * </pre>
+     */
+    @Test
+    void merge006_tipPromoteMissingOrUnbornTarget(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            // Repo starts with unborn "main"; orphan + first commit leaves main without a tip.
+            realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1");
+            Files.writeString(repoDir.toPath().resolve("generated.txt"), "generated");
+            commitAll(local, "pure");
+            ObjectId sourceTip = local.getRepository().resolve(Constants.HEAD);
+
+            assertThat(local.getRepository().resolve(Constants.R_HEADS + "main")).isNull();
+
+            String result = realSut.mergeBranch(repoDir, "pure-v1", "main");
+
+            assertThat(result).isEqualTo(sourceTip.getName());
+            assertThat(local.getRepository().getBranch()).isEqualTo("main");
+            assertThat(local.getRepository().resolve(Constants.HEAD)).isEqualTo(sourceTip);
+            assertThat(repoDir.toPath().resolve("generated.txt")).hasContent("generated");
+            try (RevWalk walk = new RevWalk(local.getRepository())) {
+                RevCommit tip = walk.parseCommit(sourceTip);
+                assertThat(tip.getParentCount()).isZero();
+            }
+            assertThat(local.getRepository().exactRef(Constants.R_HEADS + "pure-v1")).isNotNull();
+        }
+    }
+
+    /**
+     * FLOW-002: empty integration branch composition uses tip promotion so the
+     * checkpoint tag and main share the pure commit.
+     *
+     * <pre>
+     * Scenario: FLOW-002 Tag the pure commit and tip-promote into an empty integration branch
+     *   Given target branch "main" has no resolved tip
+     *   And orphan branch "pure-v1" contains only committed file "generated.txt"
+     *   When the pure commit is tagged "checkpoint-v1"
+     *   And mergeBranch merges "pure-v1" into "main"
+     *   Then tag "checkpoint-v1" still points to the pure commit containing only "generated.txt"
+     *   And "main" is checked out at that pure commit
+     *   And "main" contains only "generated.txt"
+     *   And no merge commit is created
+     *   And the orphan branch has not been pushed
+     * </pre>
+     */
+    @Test
+    void flow002_composeOrphanTagAndTipPromote(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.resolve("repository").toFile();
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        try (Git local = initializeRepositoryWithOrigin(repoDir, tempDir.resolve("remote.git"))) {
+            realSut.createAndCheckoutOrphanBranch(repoDir, "pure-v1");
+            Files.writeString(repoDir.toPath().resolve("generated.txt"), "generated");
+            commitAll(local, "pure");
+            String pureTip = local.getRepository().resolve(Constants.HEAD).getName();
+            realSut.addTag(repoDir,
+                    new org.opendatamesh.platform.git.model.Tag("checkpoint-v1", pureTip));
+
+            assertThat(local.getRepository().resolve(Constants.R_HEADS + "main")).isNull();
+
+            String promotedTip = realSut.mergeBranch(repoDir, "pure-v1", "main");
+
+            assertThat(promotedTip).isEqualTo(pureTip);
+            assertThat(local.getRepository().getBranch()).isEqualTo("main");
+            assertThat(local.getRepository().resolve(Constants.HEAD).getName()).isEqualTo(pureTip);
+            assertThat(repoDir.toPath().resolve("generated.txt")).hasContent("generated");
+            try (var children = Files.list(repoDir.toPath())) {
+                assertThat(children.map(path -> path.getFileName().toString()))
+                        .containsExactlyInAnyOrder(".git", "generated.txt");
+            }
+            try (RevWalk walk = new RevWalk(local.getRepository())) {
+                RevCommit tip = walk.parseCommit(ObjectId.fromString(promotedTip));
+                assertThat(tip.getParentCount()).isZero();
+            }
+            Ref tag = local.getRepository().exactRef(Constants.R_TAGS + "checkpoint-v1");
+            Ref peeled = local.getRepository().getRefDatabase().peel(tag);
+            ObjectId tagTarget = peeled.getPeeledObjectId() == null
+                    ? peeled.getObjectId() : peeled.getPeeledObjectId();
+            assertThat(tagTarget.getName()).isEqualTo(pureTip);
         }
     }
 

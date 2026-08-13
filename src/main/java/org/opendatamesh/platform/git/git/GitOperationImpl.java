@@ -8,6 +8,7 @@ import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.RepositoryState;
 import org.eclipse.jgit.merge.ResolveMerger;
 import org.eclipse.jgit.revwalk.RevCommit;
@@ -411,7 +412,11 @@ public class GitOperationImpl implements GitOperation {
             org.eclipse.jgit.lib.Repository repository = git.getRepository();
             assertPristineRepository("mergeBranch", git);
             ObjectId sourceTip = requireLocalBranch(repository, sourceRefName, sourceName);
-            ObjectId targetTip = requireLocalBranch(repository, targetRefName, targetName);
+            ObjectId targetTip = resolveLocalBranchTip(repository, targetRefName);
+
+            if (targetTip == null) {
+                return tipPromoteTarget(git, repository, targetRefName, targetName, sourceTip);
+            }
 
             boolean mutationStarted = false;
             try {
@@ -704,13 +709,83 @@ public class GitOperationImpl implements GitOperation {
             org.eclipse.jgit.lib.Repository repository,
             String fullRef,
             String bareName) throws IOException {
-        Ref ref = repository.exactRef(fullRef);
-        ObjectId tip = ref == null ? null : ref.getObjectId();
+        ObjectId tip = resolveLocalBranchTip(repository, fullRef);
         if (tip == null) {
             throw new GitOperationException("mergeBranch",
                     "Local branch does not exist or is unborn: " + bareName);
         }
         return tip;
+    }
+
+    private ObjectId resolveLocalBranchTip(
+            org.eclipse.jgit.lib.Repository repository,
+            String fullRef) throws IOException {
+        Ref ref = repository.exactRef(fullRef);
+        return ref == null ? null : ref.getObjectId();
+    }
+
+    /**
+     * Points a missing or unborn target branch at the source tip and checks it out.
+     * Does not create a merge commit.
+     */
+    private String tipPromoteTarget(
+            Git git,
+            org.eclipse.jgit.lib.Repository repository,
+            String targetRefName,
+            String targetName,
+            ObjectId sourceTip) {
+        boolean mutationStarted = false;
+        try {
+            mutationStarted = true;
+            RefUpdate update = repository.updateRef(targetRefName);
+            update.setNewObjectId(sourceTip);
+            update.setForceUpdate(true);
+            RefUpdate.Result updateResult = update.update();
+            if (updateResult != RefUpdate.Result.NEW
+                    && updateResult != RefUpdate.Result.FORCED
+                    && updateResult != RefUpdate.Result.FAST_FORWARD
+                    && updateResult != RefUpdate.Result.NO_CHANGE) {
+                throw new GitOperationException("mergeBranch",
+                        "Failed to tip-promote branch '" + targetName + "': " + updateResult);
+            }
+
+            git.checkout().setName(targetName).setForced(true).call();
+            assertPristineRepository("mergeBranch", git);
+
+            ObjectId promotedTip = repository.resolve(targetRefName);
+            if (promotedTip == null || !promotedTip.equals(sourceTip)) {
+                throw new GitOperationException("mergeBranch",
+                        "Target branch did not tip-promote to source tip: " + targetName);
+            }
+            return sourceTip.getName();
+        } catch (Exception failure) {
+            if (mutationStarted) {
+                try {
+                    rollbackTipPromotion(git, targetRefName, targetName);
+                } catch (Exception rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+            }
+            if (failure instanceof GitOperationException) {
+                throw (GitOperationException) failure;
+            }
+            throw new GitOperationException("mergeBranch",
+                    "Failed to tip-promote branch: " + failure.getMessage(), failure);
+        }
+    }
+
+    private void rollbackTipPromotion(Git git, String targetRefName, String targetName)
+            throws GitAPIException, IOException {
+        org.eclipse.jgit.lib.Repository repository = git.getRepository();
+        Ref target = repository.exactRef(targetRefName);
+        if (target != null) {
+            git.branchDelete()
+                    .setBranchNames(targetName)
+                    .setForce(true)
+                    .call();
+        }
+        repository.writeMergeCommitMsg(null);
+        repository.writeMergeHeads(null);
     }
 
     private boolean hasCommonAncestor(

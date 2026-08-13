@@ -13,7 +13,9 @@ Implement additive Git utilities that let consumers create and check out collisi
 - Add `void pushTag(File repoDir, String tagName)` to selectively publish exactly one named local tag to the same tag ref on `origin`, without pushing branches or other tags.
 - Add `void createAndCheckoutOrphanBranch(File repoDir, String branchName)` to create an unborn orphan branch with an empty index and empty work tree, preserving only repository metadata.
 - Add `String mergeBranch(File repoDir, String sourceBranch, String targetBranch)` to merge a local source branch into a local target branch, including unrelated histories produced by orphan commits, and return the resulting target tip SHA.
-- On merge conflict or failure after mutation starts, restore the target branch to its pre-merge tip and leave a clean work tree.
+- When the target branch is missing or unborn (no resolved tip) and the source branch has a commit tip, tip-promote: point the target ref at the source tip, check out the target, and return that SHA without creating a merge commit.
+- When the target already has a tip, keep related/unrelated merge behavior; never tip-promote over an existing target tip.
+- On merge conflict or failure after mutation starts when a pre-merge target tip existed, restore the target branch to its pre-merge tip and leave a clean work tree.
 - Add `PullRequest createPullRequest(Repository repository, CreatePullRequest createPullRequest)` to `GitProvider`.
 - Use two explicit shared DTOs: `CreatePullRequest` for create input and `PullRequest` for create result (do not reuse one model for both).
 - Implement Pull Request or Merge Request creation for GitHub, GitLab, Bitbucket Cloud, and Azure DevOps in the first release.
@@ -152,16 +154,18 @@ UnrelatedHistoryMerger --|> ResolveMerger
    - Verify the symbolic branch, unresolved `HEAD`, zero-entry index, and metadata-only work tree directly after cleanup. On failure, force-checkout and hard-reset the original branch/tip, remove any partial orphan ref, and retain rollback failures as suppressed exceptions.
 
 4. Local branch merge:
-   - Validate that the repository is clean and both exact local branch refs exist before checkout or merge.
-   - Check out the target branch and merge the source branch into it without squash or rebase.
+   - Validate that the repository is clean and the exact local **source** branch resolves to a non-null tip before checkout or merge. Reject missing or unborn **source** refs.
+   - Resolve the **target** branch: if it has a non-null tip, proceed with merge; if it is missing as a local ref or is unborn (no object id), perform **tip promotion** instead of a merge.
+   - Tip promotion: create or update `refs/heads/{target}` to the source tip object id (`RefUpdate`), force-check out the target branch, leave a clean work tree matching that tip, and return the source tip SHA. Do not create a merge commit. Do not tip-promote when the target already has a tip. On tip-promotion failure after mutation starts, force-delete the promoted target ref when present and clear merge metadata (no pre-merge tip to hard-reset).
+   - When the target already has a tip: check out the target branch and merge the source branch into it without squash or rebase.
    - Return the existing target tip without creating a commit when source and target already identify the same commit.
    - Detect whether histories are related with a `RevWalk` configured with `RevFilter.MERGE_BASE`.
    - Support unrelated histories by treating the empty tree as the merge base when no common ancestor exists. Target-only files and source-only files are both retained; conflicting additions or edits to the same paths are reported as conflicts.
    - For unrelated histories, use an in-core private `ResolveMerger` subclass with `EmptyTreeIterator`, check out its result through `DirCacheCheckout`, write merge message/head metadata, and create the commit through JGit.
    - A successful unrelated-history merge creates a merge commit whose first parent is the pre-merge target tip and whose second parent is the source tip.
    - Use the deterministic message `Merge branch '<source>' into '<target>'`; author/committer identity follows repository configuration.
-   - Return the full SHA of the target tip after success. Leave the target branch checked out.
-   - On conflict or any failure after mutation starts, ensure the target is checked out before hard-resetting it to its pre-merge tip, clear merge message/head metadata, restore a clean work tree, and throw `GitOperationException("mergeBranch", ...)`. Preserve rollback failures as suppressed exceptions.
+   - Return the full SHA of the target tip after success (merge tip or promoted tip). Leave the target branch checked out.
+   - On conflict or any failure after mutation starts when a pre-merge target tip existed, ensure the target is checked out before hard-resetting it to its pre-merge tip, clear merge message/head metadata, restore a clean work tree, and throw `GitOperationException("mergeBranch", ...)`. Preserve rollback failures as suppressed exceptions.
    - Do not push, tag, delete either branch, or invoke provider APIs.
 
 5. Provider-neutral Pull Request API:
@@ -178,7 +182,7 @@ UnrelatedHistoryMerger --|> ResolveMerger
    - Azure DevOps: `sourceRefName`, `targetRefName`, `title`, optional `description`; add `refs/heads/` to bare names and return `pullRequestId`, `_links.web.href`, and `status`.
 
 7. Error strategy:
-   - Use `GitOperationException` for repository validation, local/remote ref collisions, ls-remote failures, checkout failures, orphan cleanup failures, dirty merge preconditions, missing merge refs, merge conflicts/rollback failures, invalid or missing selective refs, and rejected selective pushes.
+   - Use `GitOperationException` for repository validation, local/remote ref collisions, ls-remote failures, checkout failures, orphan cleanup failures, dirty merge preconditions, missing or unborn merge **source** refs, merge conflicts/rollback failures, tip-promotion failures, invalid or missing selective refs, and rejected selective pushes.
    - Use `IllegalArgumentException` for invalid provider method inputs, matching current provider precondition conventions.
    - Translate HTTP 401 to `GitProviderAuthenticationException`, other HTTP responses to `GitClientException(status, responseBody)`, and transport/client failures to `GitClientException(500, message)`.
    - This library does not define a global REST exception handler; consuming applications retain responsibility for HTTP response mapping.
@@ -196,7 +200,7 @@ UnrelatedHistoryMerger --|> ResolveMerger
 
 1. `GitOperationImpl.createAndCheckoutBranch` depends on `JGitFactory.open`, `JGitFactory.lsRemoteRepository`, local repository config, and the existing credential builder.
 2. `GitOperationImpl.createAndCheckoutOrphanBranch` depends on exact local/remote ref checks, `RepositoryState`/`Status`, orphan checkout, locked `DirCache` replacement, metadata-preserving NIO cleanup, and forced checkout/hard-reset rollback.
-3. `GitOperationImpl.mergeBranch` depends on exact local refs, `RepositoryState`/`Status`, `RevWalk` merge-base detection, standard JGit merge for related histories, and a private in-core `ResolveMerger` subclass plus `EmptyTreeIterator` and `DirCacheCheckout` for unrelated histories.
+3. `GitOperationImpl.mergeBranch` depends on exact local source tip resolution, optional target tip resolution (`resolveLocalBranchTip`: born vs missing/unborn), `RepositoryState`/`Status`, tip promotion (`tipPromoteTarget` / `rollbackTipPromotion`) via local `RefUpdate` plus forced checkout when the target has no tip, `RevWalk` merge-base detection, standard JGit merge for related histories, and a private in-core `ResolveMerger` subclass plus `EmptyTreeIterator` and `DirCacheCheckout` for unrelated histories.
 4. Existing `GitOperationImpl.push` remains unchanged. `GitOperationImpl.pushBranch` and `GitOperationImpl.pushTag` depend on exact local ref resolution, explicit JGit `RefSpec` values, and push-result inspection.
 5. Each provider `createPullRequest` depends on its credential, `RestTemplate`, provider-specific request/response classes, and mapper.
 6. GitHub resolves the owner login through its existing `getOwnerName(Repository)` path.
@@ -292,7 +296,7 @@ UnrelatedHistoryMerger --|> ResolveMerger
    - Do not modify the signature, Javadoc contract, implementation behavior, or tests of `push(File repoDir, boolean pushTags)`.
 5. Orphan and merge Javadoc contracts:
    - `createAndCheckoutOrphanBranch` creates an unborn orphan branch with an empty index/work tree and no parent history; it returns `void` because no commit SHA exists yet.
-   - `mergeBranch` merges the exact local source branch into the exact local target branch, supports unrelated histories, returns the target tip SHA, and rolls back to a clean pre-merge target on conflict/failure.
+   - `mergeBranch` merges the exact local source branch into the local target branch when the target has a tip (including unrelated histories), tip-promotes the target to the source tip when the target is missing or unborn, returns the target tip SHA, and rolls back to a clean pre-merge target on conflict/failure when a pre-merge tip existed.
    - Neither operation pushes, tags, deletes branches, or calls provider APIs.
 
 ### Implement Local Branch Creation — GitOperationImpl
@@ -329,19 +333,27 @@ UnrelatedHistoryMerger --|> ResolveMerger
 
 ### Implement Local Branch Merge — GitOperationImpl
 
-1. Method `mergeBranch(File repoDir, String sourceBranch, String targetBranch)` returns the full SHA of the target tip after a successful merge.
+1. Method `mergeBranch(File repoDir, String sourceBranch, String targetBranch)` returns the full SHA of the target tip after a successful merge or tip promotion.
 2. Validate that `repoDir` is a directory; trim source and target names, normalize one leading `refs/heads/` prefix on each, reject other `refs/` namespaces, and validate both full refs with `Repository.isValidRefName`.
 3. Reject identical source and target names.
-4. Open the repository, require `RepositoryState.SAFE`, `Status.isClean()`, and no ignored entries, then resolve both exact local refs to non-null object ids. Reject missing or unborn refs before checkout.
-5. Capture the pre-merge target tip and source tip.
-6. Check out the target branch.
-7. Recheck pristine state after checkout. If source and target tips are equal, return the unchanged target SHA; otherwise perform a non-squash, non-rebase merge:
+4. Open the repository, require `RepositoryState.SAFE`, `Status.isClean()`, and no ignored entries.
+5. Resolve the exact local **source** ref to a non-null object id. Reject missing or unborn source before mutation.
+6. Resolve the exact local **target** ref via `resolveLocalBranchTip` (null tip means missing or unborn):
+   - If the target tip is a non-null object id, capture it as the pre-merge target tip and continue with merge steps below.
+   - If the target is missing or unborn (no object id), perform **tip promotion** via `tipPromoteTarget` and return:
+     - Force-update `refs/heads/{target}` to the source tip object id (`RefUpdate` accepting `NEW`, `FORCED`, `FAST_FORWARD`, or `NO_CHANGE`); do not create a merge commit.
+     - Force-checkout the target branch so HEAD and the work tree match that tip.
+     - Require a clean work tree after checkout and verify the target tip equals the source tip.
+     - Return the source tip SHA (which is now the target tip).
+     - On failure after tip-promotion mutation starts: `rollbackTipPromotion` force-deletes the target branch ref when present, clears merge message/heads metadata, and attaches rollback failures as suppressed exceptions. Tip-promotion rollback does **not** hard-reset to a pre-merge tip (none existed).
+7. When the target already had a tip: check out the target branch.
+8. Recheck pristine state after checkout. If source and target tips are equal, return the unchanged target SHA; otherwise perform a non-squash, non-rebase merge:
    - Detect a common ancestor with `RevWalk` and `RevFilter.MERGE_BASE`.
    - When a common ancestor exists, call the standard JGit `MergeCommand` with the exact source ref and deterministic message, and require a successful merge status.
    - When histories are unrelated, use an in-core private `ResolveMerger` subclass and `EmptyTreeIterator` as the synthetic merge base.
    - Preserve target-only and source-only paths.
    - Treat incompatible changes to the same path, including add/add differences, as conflicts.
-8. On a successful unrelated-history merge, create a commit with:
+9. On a successful unrelated-history merge, create a commit with:
    - Checkout: apply the in-core result tree with `DirCacheCheckout` and conflict failure enabled.
    - Merge metadata: write the deterministic merge message and source tip as merge head before committing.
    - Tree: merged result.
@@ -349,14 +361,15 @@ UnrelatedHistoryMerger --|> ResolveMerger
    - Second parent: source tip.
    - Message: `Merge branch '<source>' into '<target>'`.
    - Author/committer: repository-configured identity.
-9. On success, resolve the exact target ref, verify an unrelated-history commit advanced that ref to the returned commit, and return its full SHA with target still checked out.
-10. On conflict or failure after mutation starts:
+10. On success of a born-target merge, resolve the exact target ref, verify an unrelated-history commit advanced that ref to the returned commit when applicable, and return its full SHA with target still checked out.
+11. On conflict or failure after mutation starts when a pre-merge target tip existed:
     - Force-checkout target first when it is not current, so rollback cannot reset another branch.
     - Hard-reset target to the captured pre-merge target tip.
     - Remove merge metadata/state and conflict entries.
     - Verify the work tree is clean.
     - Throw `GitOperationException("mergeBranch", ...)`; include unrelated-history unmerged paths when available and attach rollback failures as suppressed exceptions.
-11. Do not push, tag, delete source/target branches, or invoke provider HTTP APIs.
+12. Do not push, tag, delete source/target branches, or invoke provider HTTP APIs.
+13. Never tip-promote when the target already has a tip; never use tip promotion to overwrite or hard-reset an existing target commit.
 
 ### Implement Selective Push — GitOperationImpl
 
@@ -632,7 +645,7 @@ Feature: Merge local branches including unrelated orphan history
       | targetBranch is blank |
       | sourceBranch equals targetBranch |
       | the local source branch does not exist |
-      | the local target branch does not exist |
+      | the local source branch is unborn |
       | the work tree is not pristine |
 
   Scenario: MERGE-005 Merge does not perform remote or provider side effects
@@ -642,6 +655,17 @@ Feature: Merge local branches including unrelated orphan history
     And no tag is created
     And no branch is deleted
     And no provider HTTP API is called
+
+  Scenario: MERGE-006 Tip-promote when the target branch is missing or unborn
+    Given orphan source branch "pure-v1" at commit "P1" containing "generated.txt"
+    And target branch "main" has no resolved tip
+    And the repository work tree is clean
+    When mergeBranch merges "pure-v1" into "main"
+    Then "main" is checked out at commit "P1"
+    And the returned SHA equals the full SHA of "P1"
+    And "main" contains "generated.txt"
+    And no merge commit is created
+    And neither branch is pushed or deleted
 ```
 
 ```gherkin
@@ -654,6 +678,17 @@ Feature: Compose a pure checkpoint and integration merge
     And mergeBranch merges "pure-v1" into "main"
     Then tag "checkpoint-v1" still points to the pure commit containing only "generated.txt"
     And "main" contains both "user.txt" and "generated.txt"
+    And the orphan branch has not been pushed
+
+  Scenario: FLOW-002 Tag the pure commit and tip-promote into an empty integration branch
+    Given target branch "main" has no resolved tip
+    And orphan branch "pure-v1" contains only committed file "generated.txt"
+    When the pure commit is tagged "checkpoint-v1"
+    And mergeBranch merges "pure-v1" into "main"
+    Then tag "checkpoint-v1" still points to the pure commit containing only "generated.txt"
+    And "main" is checked out at that pure commit
+    And "main" contains only "generated.txt"
+    And no merge commit is created
     And the orphan branch has not been pushed
 ```
 
@@ -855,11 +890,11 @@ Feature: Keep Pull Request request and response DTOs explicit
    - Copy the full scenario text verbatim as a Java block comment immediately above the corresponding `@Test` / `@ParameterizedTest`.
 
 2. Extend `GitOperationImplTest`:
-   - Implement `BR-001` through `BR-006`, `ORPH-001` through `ORPH-007`, `MERGE-001` through `MERGE-005`, `FLOW-001`, and `PUSH-001` through `PUSH-009`.
+   - Implement `BR-001` through `BR-006`, `ORPH-001` through `ORPH-007`, `MERGE-001` through `MERGE-006`, `FLOW-001`, `FLOW-002`, and `PUSH-001` through `PUSH-009`.
    - A scenario outline may use a JUnit parameterized test only when each examples row is executed and identifiable in test reports.
    - Keep the pre-feature legacy push tests and expectations intact for `PUSH-001` and `PUSH-002`.
    - Use a real local repository and bare remote for `PUSH-005` and `PUSH-008`; mock JGit commands for focused interaction/error scenarios.
-   - Use real local repositories for `ORPH-001`, `MERGE-001`, `MERGE-002`, `MERGE-003`, and `FLOW-001`; verify commit parent order, tree contents, tag target, and rollback state directly through JGit.
+   - Use real local repositories for `ORPH-001`, `MERGE-001`, `MERGE-002`, `MERGE-003`, `MERGE-006`, `FLOW-001`, and `FLOW-002`; verify commit parent order, tip-promotion equality, tree contents, tag target, and rollback state directly through JGit.
 3. Add `PullRequestModelTest`:
    - Implement `DTO-001` and `DTO-002`.
    - Prefer direct API/compile-time assertions; reflection is acceptable for proving result-only fields are absent from `CreatePullRequest`.
@@ -879,6 +914,8 @@ Feature: Keep Pull Request request and response DTOs explicit
 1. Update `docs/ARCHITECTURE.md`:
    - Add local branch creation and selective branch/tag push guarantees to `GitOperation`.
    - Add pure orphan branch creation and local related/unrelated-history merge semantics to `GitOperation`.
+   - Document tip promotion when `mergeBranch` target is missing or unborn.
+   - Document full `mergeBranch` behaviour: related merge, unrelated two-parent merge, equal-tip no-op, tip promotion, and conflict/rollback rules.
    - Document that the existing `push(File, boolean)` behavior remains unchanged.
    - Add Pull Request creation and provider mappings to `GitProvider`.
    - Document same-repository and push-before-create constraints.
@@ -917,7 +954,7 @@ Feature: Keep Pull Request request and response DTOs explicit
    - Use AssertJ and Mockito conventions already present.
    - Prefer exact request/ref assertions over broad `any()` verification for new behavior.
    - Include real-JGit bare-remote tests for selective branch and selective tag push semantics.
-   - Include real-JGit tests for orphan parentlessness, empty tree, unrelated-history merge parent order/content preservation, conflict rollback, and pure-tag retention.
+   - Include real-JGit tests for orphan parentlessness, empty tree, unrelated-history merge parent order/content preservation, conflict rollback, tip promotion onto a missing/unborn target, and pure-tag retention.
    - Preserve existing legacy `push` tests and expectations unchanged.
    - Implement every Gherkin scenario in this prompt; keep the scenario ID traceable in the test name or display name.
    - Copy the complete Gherkin scenario verbatim into a block comment immediately above its test annotation.
@@ -930,7 +967,8 @@ Feature: Keep Pull Request request and response DTOs explicit
 1. Branch safety:
    - Never create the branch if the exact full ref exists locally or on `origin`.
    - Remote existence must use authenticated `ls-remote`; do not trust shallow-clone remote-tracking refs.
-   - Never force-create, reset, overwrite, or force-push a branch.
+   - Never force-create, reset, overwrite, or force-push a **born** branch tip.
+   - Tip promotion may create or update a **missing or unborn** target ref to the source tip only; it must never overwrite an existing target tip.
    - Orphan creation must refuse any non-pristine work tree, including untracked and ignored files, before deleting work-tree entries.
 2. Start-point integrity:
    - Create from current `HEAD` only.
@@ -942,13 +980,16 @@ Feature: Keep Pull Request request and response DTOs explicit
    - Never delete a `.git` file/directory or external repository metadata path, and never follow a symbolic link outside the work-tree root.
    - Failure after orphan checkout must force-checkout and hard-reset the original branch/tip, restore its committed work tree, remove the partial orphan ref when materialized, and retain rollback failure details.
 4. Merge integrity:
-   - Merge exact local branch refs only; source and target must differ.
-   - Require a pristine work tree before checkout or merge.
-   - Equal source and target tips are a successful no-op that returns the existing target SHA.
+   - Merge or tip-promote using exact local branch names only; source and target must differ.
+   - Require a pristine work tree before checkout, merge, or tip promotion.
+   - Source must resolve to a non-null tip; missing or unborn source is rejected.
+   - When the target tip is missing or unborn, tip-promote the target to the source tip, check out the target, return that SHA, and do not create a merge commit.
+   - On tip-promotion failure after mutation starts, force-delete the promoted target ref when present and clear merge metadata; do not invent a pre-merge tip to reset to.
+   - Equal source and target tips (both born) are a successful no-op that returns the existing target SHA.
    - Unrelated histories use the empty tree as merge base; a successful result has target tip as first parent and source tip as second parent.
    - Preserve target-only and source-only paths; surface same-path conflicts.
-   - On conflict/failure, check out target before hard-resetting its exact pre-merge tip, remove merge state/conflicts, leave a clean work tree, and retain rollback failure details without resetting another branch.
-   - `mergeBranch` never pushes, tags, deletes branches, or invokes provider APIs.
+   - On conflict/failure when a pre-merge target tip existed, check out target before hard-resetting its exact pre-merge tip, remove merge state/conflicts, leave a clean work tree, and retain rollback failure details without resetting another branch.
+   - `mergeBranch` never pushes, tags, deletes branches (except tip-promotion rollback of a partially promoted target), or invokes provider APIs.
 5. Push integrity:
    - Preserve the legacy `push(File, boolean)` implementation and behavior exactly, including `setPushAll()` and optional `setPushTags()`.
    - `pushBranch` publishes exactly one named branch ref and no tags or other branches.
@@ -978,5 +1019,5 @@ Feature: Keep Pull Request request and response DTOs explicit
    - Selective branch and tag publication is available only through the two new additive methods.
 11. Verification:
    - All existing tests plus the new local-Git and four-provider test suites must pass.
-   - Tests must prove no branch mutation occurs after local/remote collision, orphan creation is parentless and empty, unrelated-history merge preserves independent paths and rolls conflicts back, pure tags remain attached to pure commits, no selective push occurs for a missing local ref, unrelated refs are not published by selective methods, and no HTTP call occurs after invalid PR input.
+   - Tests must prove no branch mutation occurs after local/remote collision, orphan creation is parentless and empty, unrelated-history merge preserves independent paths and rolls conflicts back, tip promotion places a missing/unborn target on the source tip without a merge commit, pure tags remain attached to pure commits, no selective push occurs for a missing local ref, unrelated refs are not published by selective methods, and no HTTP call occurs after invalid PR input.
    - Every Gherkin scenario ID (`BR-*`, `ORPH-*`, `MERGE-*`, `FLOW-*`, `PUSH-*`, `PR-*`, `DTO-*`) must map to an executed test, and every mapped test must carry its Gherkin comment immediately above the test annotation.

@@ -154,15 +154,17 @@ public interface GitOperation {
 
     /**
      * Merges a local source branch into a local target branch, including unrelated
-     * orphan history. Leaves the target branch checked out and returns its full tip
-     * SHA. Conflicts restore the target to its pre-merge tip.
+     * orphan history. When the target is missing or unborn, tip-promotes the target
+     * to the source tip without creating a merge commit. Leaves the target branch
+     * checked out and returns its full tip SHA. Conflicts restore the target to its
+     * pre-merge tip when one existed.
      *
-     * @param repoDir     the local repository root directory
-     * @param sourceBranch source branch name
-     * @param targetBranch target branch name
-     * @return full SHA of the target tip after merge
+     * @param repoDir      the local repository root directory
+     * @param sourceBranch source branch name (must resolve to a commit tip)
+     * @param targetBranch target branch name (born tip is merged; missing/unborn is tip-promoted)
+     * @return full SHA of the target tip after merge or tip promotion
      * @throws org.opendatamesh.platform.git.exceptions.GitOperationException if validation,
-     *                                                                         merge, or rollback fails
+     *                                                                         merge, tip promotion, or rollback fails
      */
     String mergeBranch(File repoDir, String sourceBranch, String targetBranch);
 
