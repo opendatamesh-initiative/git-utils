@@ -77,6 +77,19 @@ public interface GitProvider {
     Repository createRepository(Repository repositoryToCreate);
 
     /**
+     * Creates a same-repository Pull Request / Merge Request via the provider HTTP API.
+     * <p>
+     * The caller must already have pushed the source branch. This method does not push,
+     * merge, or delete branches. When {@code createPullRequest.getTargetBranch()} is blank,
+     * the target defaults to {@code repository.getDefaultBranch()}.
+     *
+     * @param repository         the target repository
+     * @param createPullRequest  create input (required {@code sourceBranch} and {@code title})
+     * @return the created Pull Request with at least {@code id} and {@code webUrl}
+     */
+    PullRequest createPullRequest(Repository repository, CreatePullRequest createPullRequest);
+
+    /**
      * Returns a paginated list of commits in the given repository, optionally filtered.
      *
      * @param repository the repository

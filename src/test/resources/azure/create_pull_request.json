@@ -1,0 +1,13 @@
+{
+  "pullRequestId": 99,
+  "title": "Update v2",
+  "description": "Generated update",
+  "status": "active",
+  "sourceRefName": "refs/heads/update-v2",
+  "targetRefName": "refs/heads/main",
+  "_links": {
+    "web": {
+      "href": "https://dev.azure.com/org/project/_git/repo/pullrequest/99"
+    }
+  }
+}

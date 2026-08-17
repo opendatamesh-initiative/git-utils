@@ -1,0 +1,21 @@
+{
+  "id": 15,
+  "title": "Update v2",
+  "description": "Generated update",
+  "state": "OPEN",
+  "source": {
+    "branch": {
+      "name": "update-v2"
+    }
+  },
+  "destination": {
+    "branch": {
+      "name": "main"
+    }
+  },
+  "links": {
+    "html": {
+      "href": "https://bitbucket.org/test-workspace/test-repo/pull-requests/15"
+    }
+  }
+}

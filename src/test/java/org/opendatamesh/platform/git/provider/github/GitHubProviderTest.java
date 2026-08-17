@@ -4,12 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opendatamesh.platform.git.exceptions.GitClientException;
+import org.opendatamesh.platform.git.exceptions.GitProviderAuthenticationException;
 import org.opendatamesh.platform.git.model.*;
 import org.opendatamesh.platform.git.provider.GitProviderCredential;
-import org.opendatamesh.platform.git.provider.github.GitHubProvider;
 import org.opendatamesh.platform.git.provider.github.credentials.GitHubPatCredential;
+import org.opendatamesh.platform.git.provider.github.resources.createpullrequest.GitHubCreatePullRequestReq;
+import org.opendatamesh.platform.git.provider.github.resources.createpullrequest.GitHubCreatePullRequestRes;
 import org.opendatamesh.platform.git.provider.github.resources.getcurrentuser.GitHubGetCurrentUserUserRes;
 import org.opendatamesh.platform.git.provider.github.resources.getorganization.GitHubGetOrganizationOrganizationRes;
 import org.opendatamesh.platform.git.provider.github.resources.getrepository.GitHubGetRepositoryRepositoryRes;
@@ -29,6 +35,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 
 import java.io.InputStream;
@@ -647,6 +654,219 @@ class GitHubProviderTest {
                 eq(GitHubListCommitsCommitRes[].class),
                 eq(queryParams)
         );
+    }
+
+    /*
+     * Scenario Outline: PR-001 Create a Pull Request with an explicit target branch
+     *   Given a valid GitHub repository
+     *   And a CreatePullRequest with source "update-v2", target "main", title "Update v2", and body "Generated update"
+     *   And the source branch has already been pushed
+     *   When createPullRequest is called
+     *   Then the GitHub create Pull Request endpoint is called once with the expected authenticated POST request
+     *   And the provider payload maps source, target, title, and body correctly
+     *   And the returned PullRequest contains non-blank id and webUrl
+     *   And the returned source branch, target branch, title, body, and state are mapped correctly
+     *   And no Git push, merge, or branch deletion is performed
+     */
+    @Test
+    void pr001_createPullRequestWithExplicitTarget() throws Exception {
+        GitHubCreatePullRequestRes prRes = loadJson("github/create_pull_request.json", GitHubCreatePullRequestRes.class);
+        GitHubGetOrganizationOrganizationRes orgRes = loadJson("github/get_organization.json", GitHubGetOrganizationOrganizationRes.class);
+
+        Repository repository = githubRepository();
+        CreatePullRequest request = new CreatePullRequest("update-v2", "main", "Update v2", "Generated update");
+
+        when(restTemplate.exchange(
+                eq(baseUrl + "/orgs/{id}"),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitHubGetOrganizationOrganizationRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(orgRes, HttpStatus.OK));
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repos/{owner}/{repo}/pulls"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitHubCreatePullRequestRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(prRes, HttpStatus.CREATED));
+
+        PullRequest result = gitHubProvider.createPullRequest(repository, request);
+
+        assertThat(result.getId()).isEqualTo("42");
+        assertThat(result.getWebUrl()).isEqualTo("https://github.com/test-org/test-repo/pull/42");
+        assertThat(result.getSourceBranch()).isEqualTo("update-v2");
+        assertThat(result.getTargetBranch()).isEqualTo("main");
+        assertThat(result.getTitle()).isEqualTo("Update v2");
+        assertThat(result.getBody()).isEqualTo("Generated update");
+        assertThat(result.getState()).isEqualTo("open");
+
+        ArgumentCaptor<HttpEntity> entityCaptor = ArgumentCaptor.forClass(HttpEntity.class);
+        verify(restTemplate).exchange(
+                eq(baseUrl + "/repos/{owner}/{repo}/pulls"),
+                eq(HttpMethod.POST),
+                entityCaptor.capture(),
+                eq(GitHubCreatePullRequestRes.class),
+                anyMap()
+        );
+        GitHubCreatePullRequestReq body = (GitHubCreatePullRequestReq) entityCaptor.getValue().getBody();
+        assertThat(body.getHead()).isEqualTo("update-v2");
+        assertThat(body.getBase()).isEqualTo("main");
+        assertThat(body.getTitle()).isEqualTo("Update v2");
+        assertThat(body.getBody()).isEqualTo("Generated update");
+    }
+
+    /*
+     * Scenario Outline: PR-002 Default the target branch from the repository
+     *   Given a valid GitHub repository whose default branch is "main"
+     *   And a CreatePullRequest with source "update-v2", blank target, and title "Update v2"
+     *   When createPullRequest is called
+     *   Then the provider request uses "main" as the target branch
+     *   And the returned PullRequest has target branch "main"
+     */
+    @Test
+    void pr002_defaultTargetBranchFromRepository() throws Exception {
+        GitHubCreatePullRequestRes prRes = loadJson("github/create_pull_request.json", GitHubCreatePullRequestRes.class);
+        GitHubGetOrganizationOrganizationRes orgRes = loadJson("github/get_organization.json", GitHubGetOrganizationOrganizationRes.class);
+        Repository repository = githubRepository();
+        CreatePullRequest request = new CreatePullRequest("update-v2", null, "Update v2", null);
+
+        when(restTemplate.exchange(
+                eq(baseUrl + "/orgs/{id}"),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitHubGetOrganizationOrganizationRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(orgRes, HttpStatus.OK));
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repos/{owner}/{repo}/pulls"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitHubCreatePullRequestRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(prRes, HttpStatus.CREATED));
+
+        PullRequest result = gitHubProvider.createPullRequest(repository, request);
+
+        assertThat(result.getTargetBranch()).isEqualTo("main");
+        ArgumentCaptor<HttpEntity> entityCaptor = ArgumentCaptor.forClass(HttpEntity.class);
+        verify(restTemplate).exchange(
+                eq(baseUrl + "/repos/{owner}/{repo}/pulls"),
+                eq(HttpMethod.POST),
+                entityCaptor.capture(),
+                eq(GitHubCreatePullRequestRes.class),
+                anyMap()
+        );
+        assertThat(((GitHubCreatePullRequestReq) entityCaptor.getValue().getBody()).getBase()).isEqualTo("main");
+    }
+
+    /*
+     * Scenario Outline: PR-003 Reject invalid Pull Request input before HTTP
+     *   Given a valid GitHub instance
+     *   And <invalid input>
+     *   When createPullRequest is called
+     *   Then an IllegalArgumentException describing the invalid field is thrown
+     *   And the provider HTTP API is not called
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "nullRepo, update-v2, main, Update v2",
+            "blankSource, , main, Update v2",
+            "blankTitle, update-v2, main, ",
+            "blankDefault, update-v2, , Update v2",
+            "sameBranches, main, main, Update v2"
+    })
+    void pr003_rejectInvalidPullRequestInputBeforeHttp(String caseName, String source, String target, String title) {
+        Repository repository = "nullRepo".equals(caseName) ? null : githubRepository();
+        if (repository != null && "blankDefault".equals(caseName)) {
+            repository.setDefaultBranch(null);
+        }
+        CreatePullRequest request = new CreatePullRequest(source, target, title, null);
+
+        assertThatThrownBy(() -> gitHubProvider.createPullRequest(repository, request))
+                .isInstanceOf(IllegalArgumentException.class);
+        verify(restTemplate, never()).exchange(anyString(), eq(HttpMethod.POST), any(), any(Class.class), anyMap());
+    }
+
+    /*
+     * Scenario Outline: PR-004 Map provider authentication failure
+     *   Given a valid GitHub repository and CreatePullRequest
+     *   And the provider create Pull Request API returns HTTP 401
+     *   When createPullRequest is called
+     *   Then GitProviderAuthenticationException is thrown
+     */
+    @Test
+    void pr004_mapProviderAuthenticationFailure() throws Exception {
+        GitHubGetOrganizationOrganizationRes orgRes = loadJson("github/get_organization.json", GitHubGetOrganizationOrganizationRes.class);
+        Repository repository = githubRepository();
+        CreatePullRequest request = new CreatePullRequest("update-v2", "main", "Update v2", null);
+
+        when(restTemplate.exchange(
+                eq(baseUrl + "/orgs/{id}"),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitHubGetOrganizationOrganizationRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(orgRes, HttpStatus.OK));
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repos/{owner}/{repo}/pulls"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitHubCreatePullRequestRes.class),
+                anyMap()
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.UNAUTHORIZED, "Unauthorized",
+                org.springframework.http.HttpHeaders.EMPTY, new byte[0], null));
+
+        assertThatThrownBy(() -> gitHubProvider.createPullRequest(repository, request))
+                .isInstanceOf(GitProviderAuthenticationException.class);
+    }
+
+    /*
+     * Scenario Outline: PR-005 Preserve provider HTTP errors
+     *   Given a valid GitHub repository and CreatePullRequest
+     *   And the provider create Pull Request API returns a non-401 error with status and response body
+     *   When createPullRequest is called
+     *   Then GitClientException preserves the provider status and response body
+     */
+    @Test
+    void pr005_preserveProviderHttpErrors() throws Exception {
+        GitHubGetOrganizationOrganizationRes orgRes = loadJson("github/get_organization.json", GitHubGetOrganizationOrganizationRes.class);
+        Repository repository = githubRepository();
+        CreatePullRequest request = new CreatePullRequest("update-v2", "main", "Update v2", null);
+
+        when(restTemplate.exchange(
+                eq(baseUrl + "/orgs/{id}"),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitHubGetOrganizationOrganizationRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(orgRes, HttpStatus.OK));
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repos/{owner}/{repo}/pulls"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitHubCreatePullRequestRes.class),
+                anyMap()
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.UNPROCESSABLE_ENTITY, "Validation Failed",
+                org.springframework.http.HttpHeaders.EMPTY, "{\"message\":\"Validation Failed\"}".getBytes(), null));
+
+        assertThatThrownBy(() -> gitHubProvider.createPullRequest(repository, request))
+                .isInstanceOf(GitClientException.class)
+                .satisfies(ex -> {
+                    GitClientException gitEx = (GitClientException) ex;
+                    assertThat(gitEx.getCode()).isEqualTo(422);
+                    assertThat(gitEx.getResponseBody()).contains("Validation Failed");
+                });
+    }
+
+    private Repository githubRepository() {
+        Repository repository = new Repository();
+        repository.setName("test-repo");
+        repository.setId("342219496");
+        repository.setOwnerId("test-org");
+        repository.setOwnerType(RepositoryOwnerType.ORGANIZATION);
+        repository.setDefaultBranch("main");
+        return repository;
     }
 }
 

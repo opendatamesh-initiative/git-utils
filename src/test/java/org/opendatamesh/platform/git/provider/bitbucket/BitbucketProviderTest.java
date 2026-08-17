@@ -4,12 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opendatamesh.platform.git.exceptions.GitClientException;
+import org.opendatamesh.platform.git.exceptions.GitProviderAuthenticationException;
 import org.opendatamesh.platform.git.model.*;
 import org.opendatamesh.platform.git.provider.GitProviderCredential;
-import org.opendatamesh.platform.git.provider.bitbucket.BitbucketProvider;
 import org.opendatamesh.platform.git.provider.bitbucket.credentials.BitbucketPatCredential;
+import org.opendatamesh.platform.git.provider.bitbucket.resources.createpullrequest.BitbucketCreatePullRequestReq;
+import org.opendatamesh.platform.git.provider.bitbucket.resources.createpullrequest.BitbucketCreatePullRequestRes;
 import org.opendatamesh.platform.git.provider.bitbucket.resources.getcurrentuser.BitbucketGetCurrentUserUserRes;
 import org.opendatamesh.platform.git.provider.bitbucket.resources.getorganization.BitbucketGetOrganizationWorkspaceRes;
 import org.opendatamesh.platform.git.provider.bitbucket.resources.getrepository.BitbucketGetRepositoryRepositoryRes;
@@ -29,6 +35,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 
 import java.io.InputStream;
@@ -567,6 +574,177 @@ class BitbucketProviderTest {
             throw new IllegalArgumentException("Resource not found: " + resourcePath);
         }
         return objectMapper.readValue(inputStream, clazz);
+    }
+
+    /*
+     * Scenario Outline: PR-001 Create a Pull Request with an explicit target branch
+     *   Given a valid Bitbucket repository
+     *   And a CreatePullRequest with source "update-v2", target "main", title "Update v2", and body "Generated update"
+     *   And the source branch has already been pushed
+     *   When createPullRequest is called
+     *   Then the Bitbucket create Pull Request endpoint is called once with the expected authenticated POST request
+     *   And the provider payload maps source, target, title, and body correctly
+     *   And the returned PullRequest contains non-blank id and webUrl
+     *   And the returned source branch, target branch, title, body, and state are mapped correctly
+     *   And no Git push, merge, or branch deletion is performed
+     */
+    @Test
+    void pr001_createPullRequestWithExplicitTarget() throws Exception {
+        BitbucketCreatePullRequestRes prRes = loadJson("bitbucket/create_pull_request.json", BitbucketCreatePullRequestRes.class);
+        Repository repository = bitbucketRepository();
+        CreatePullRequest request = new CreatePullRequest("update-v2", "main", "Update v2", "Generated update");
+
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(BitbucketCreatePullRequestRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(prRes, HttpStatus.CREATED));
+
+        PullRequest result = bitbucketProvider.createPullRequest(repository, request);
+
+        assertThat(result.getId()).isEqualTo("15");
+        assertThat(result.getWebUrl()).contains("pull-requests/15");
+        assertThat(result.getSourceBranch()).isEqualTo("update-v2");
+        assertThat(result.getTargetBranch()).isEqualTo("main");
+        assertThat(result.getTitle()).isEqualTo("Update v2");
+        assertThat(result.getBody()).isEqualTo("Generated update");
+        assertThat(result.getState()).isEqualTo("OPEN");
+
+        ArgumentCaptor<HttpEntity> entityCaptor = ArgumentCaptor.forClass(HttpEntity.class);
+        verify(restTemplate).exchange(
+                eq(baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests"),
+                eq(HttpMethod.POST),
+                entityCaptor.capture(),
+                eq(BitbucketCreatePullRequestRes.class),
+                anyMap()
+        );
+        BitbucketCreatePullRequestReq body = (BitbucketCreatePullRequestReq) entityCaptor.getValue().getBody();
+        assertThat(body.getSource().getBranch().getName()).isEqualTo("update-v2");
+        assertThat(body.getDestination().getBranch().getName()).isEqualTo("main");
+        assertThat(body.getTitle()).isEqualTo("Update v2");
+        assertThat(body.getDescription()).isEqualTo("Generated update");
+    }
+
+    /*
+     * Scenario Outline: PR-002 Default the target branch from the repository
+     *   Given a valid Bitbucket repository whose default branch is "main"
+     *   And a CreatePullRequest with source "update-v2", blank target, and title "Update v2"
+     *   When createPullRequest is called
+     *   Then the provider request uses "main" as the target branch
+     *   And the returned PullRequest has target branch "main"
+     */
+    @Test
+    void pr002_defaultTargetBranchFromRepository() throws Exception {
+        BitbucketCreatePullRequestRes prRes = loadJson("bitbucket/create_pull_request.json", BitbucketCreatePullRequestRes.class);
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(BitbucketCreatePullRequestRes.class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(prRes, HttpStatus.CREATED));
+
+        PullRequest result = bitbucketProvider.createPullRequest(
+                bitbucketRepository(), new CreatePullRequest("update-v2", null, "Update v2", null));
+
+        assertThat(result.getTargetBranch()).isEqualTo("main");
+        ArgumentCaptor<HttpEntity> entityCaptor = ArgumentCaptor.forClass(HttpEntity.class);
+        verify(restTemplate).exchange(
+                eq(baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests"),
+                eq(HttpMethod.POST),
+                entityCaptor.capture(),
+                eq(BitbucketCreatePullRequestRes.class),
+                anyMap()
+        );
+        assertThat(((BitbucketCreatePullRequestReq) entityCaptor.getValue().getBody())
+                .getDestination().getBranch().getName()).isEqualTo("main");
+    }
+
+    /*
+     * Scenario Outline: PR-003 Reject invalid Pull Request input before HTTP
+     *   Given a valid Bitbucket instance
+     *   And <invalid input>
+     *   When createPullRequest is called
+     *   Then an IllegalArgumentException describing the invalid field is thrown
+     *   And the provider HTTP API is not called
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "nullRepo, update-v2, main, Update v2",
+            "blankSource, , main, Update v2",
+            "blankTitle, update-v2, main, ",
+            "blankDefault, update-v2, , Update v2",
+            "sameBranches, main, main, Update v2"
+    })
+    void pr003_rejectInvalidPullRequestInputBeforeHttp(String caseName, String source, String target, String title) {
+        Repository repository = "nullRepo".equals(caseName) ? null : bitbucketRepository();
+        if (repository != null && "blankDefault".equals(caseName)) {
+            repository.setDefaultBranch(null);
+        }
+        assertThatThrownBy(() -> bitbucketProvider.createPullRequest(repository, new CreatePullRequest(source, target, title, null)))
+                .isInstanceOf(IllegalArgumentException.class);
+        verify(restTemplate, never()).exchange(anyString(), eq(HttpMethod.POST), any(), any(Class.class), anyMap());
+    }
+
+    /*
+     * Scenario Outline: PR-004 Map provider authentication failure
+     *   Given a valid Bitbucket repository and CreatePullRequest
+     *   And the provider create Pull Request API returns HTTP 401
+     *   When createPullRequest is called
+     *   Then GitProviderAuthenticationException is thrown
+     */
+    @Test
+    void pr004_mapProviderAuthenticationFailure() {
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(BitbucketCreatePullRequestRes.class),
+                anyMap()
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.UNAUTHORIZED, "Unauthorized",
+                org.springframework.http.HttpHeaders.EMPTY, new byte[0], null));
+
+        assertThatThrownBy(() -> bitbucketProvider.createPullRequest(
+                bitbucketRepository(), new CreatePullRequest("update-v2", "main", "Update v2", null)))
+                .isInstanceOf(GitProviderAuthenticationException.class);
+    }
+
+    /*
+     * Scenario Outline: PR-005 Preserve provider HTTP errors
+     *   Given a valid Bitbucket repository and CreatePullRequest
+     *   And the provider create Pull Request API returns a non-401 error with status and response body
+     *   When createPullRequest is called
+     *   Then GitClientException preserves the provider status and response body
+     */
+    @Test
+    void pr005_preserveProviderHttpErrors() {
+        when(restTemplate.exchange(
+                eq(baseUrl + "/repositories/{ownerId}/{repoName}/pullrequests"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(BitbucketCreatePullRequestRes.class),
+                anyMap()
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.BAD_REQUEST, "Bad Request",
+                org.springframework.http.HttpHeaders.EMPTY, "{\"error\":\"bad\"}".getBytes(), null));
+
+        assertThatThrownBy(() -> bitbucketProvider.createPullRequest(
+                bitbucketRepository(), new CreatePullRequest("update-v2", "main", "Update v2", null)))
+                .isInstanceOf(GitClientException.class)
+                .satisfies(ex -> {
+                    GitClientException gitEx = (GitClientException) ex;
+                    assertThat(gitEx.getCode()).isEqualTo(400);
+                    assertThat(gitEx.getResponseBody()).contains("bad");
+                });
+    }
+
+    private Repository bitbucketRepository() {
+        Repository repository = new Repository();
+        repository.setOwnerId("test-workspace");
+        repository.setName("test-repo");
+        repository.setDefaultBranch("main");
+        return repository;
     }
 }
 

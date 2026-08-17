@@ -8,6 +8,9 @@ import org.opendatamesh.platform.git.git.GitOperationImpl;
 import org.opendatamesh.platform.git.model.*;
 import org.opendatamesh.platform.git.provider.GitProvider;
 import org.opendatamesh.platform.git.provider.GitProviderCredential;
+import org.opendatamesh.platform.git.provider.azure.resources.createpullrequest.AzureCreatePullRequestMapper;
+import org.opendatamesh.platform.git.provider.azure.resources.createpullrequest.AzureCreatePullRequestReq;
+import org.opendatamesh.platform.git.provider.azure.resources.createpullrequest.AzureCreatePullRequestRes;
 import org.opendatamesh.platform.git.provider.azure.resources.createrepository.AzureCreateRepositoryMapper;
 import org.opendatamesh.platform.git.provider.azure.resources.createrepository.AzureCreateRepositoryRepositoryRes;
 import org.opendatamesh.platform.git.provider.azure.resources.createrepository.AzureCreateRepositoryReq;
@@ -454,6 +457,71 @@ public class AzureDevOpsProvider implements GitProvider {
     @Override
     public GitOperation gitOperation() {
         return new GitOperationImpl(credential.createGitCredential());
+    }
+
+    @Override
+    public PullRequest createPullRequest(Repository repository, CreatePullRequest createPullRequest) {
+        String resolvedTarget = resolveAndValidateCreatePullRequest(repository, createPullRequest);
+        try {
+            HttpHeaders headers = credential.createGitProviderHeaders();
+            headers.set("Content-Type", "application/json");
+
+            AzureCreatePullRequestReq request = AzureCreatePullRequestMapper.fromInternalModel(createPullRequest, resolvedTarget);
+            HttpEntity<AzureCreatePullRequestReq> requestEntity = new HttpEntity<>(request, headers);
+
+            String uriTemplate = baseUrl + "/{projectId}/_apis/git/repositories/{repoId}/pullrequests?api-version={apiVersion}";
+            Map<String, Object> uriVariables = new HashMap<>();
+            uriVariables.put("projectId", repository.getOwnerId());
+            uriVariables.put("repoId", repository.getId());
+            uriVariables.put("apiVersion", "7.1");
+
+            ResponseEntity<AzureCreatePullRequestRes> response = restTemplate.exchange(
+                    uriTemplate,
+                    HttpMethod.POST,
+                    requestEntity,
+                    AzureCreatePullRequestRes.class,
+                    uriVariables
+            );
+
+            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
+                return AzureCreatePullRequestMapper.toInternalModel(response.getBody(), createPullRequest, resolvedTarget);
+            }
+            throw new GitClientException(response.getStatusCode().value(),
+                    "Failed to create pull request. Status: " + response.getStatusCode());
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 401) {
+                throw new GitProviderAuthenticationException("Azure DevOps authentication failed with provider. Please check your credentials.");
+            }
+            throw new GitClientException(e.getStatusCode().value(),
+                    "Azure DevOps request failed to create pull request: " + e.getResponseBodyAsString());
+        } catch (RestClientException e) {
+            throw new GitClientException(500, "Azure DevOps request failed to create pull request: " + e.getMessage());
+        }
+    }
+
+    private String resolveAndValidateCreatePullRequest(Repository repository, CreatePullRequest createPullRequest) {
+        if (repository == null) {
+            throw new IllegalArgumentException("Repository is required");
+        }
+        if (createPullRequest == null) {
+            throw new IllegalArgumentException("CreatePullRequest is required");
+        }
+        if (!StringUtils.hasText(createPullRequest.getSourceBranch())) {
+            throw new IllegalArgumentException("sourceBranch is required");
+        }
+        if (!StringUtils.hasText(createPullRequest.getTitle())) {
+            throw new IllegalArgumentException("title is required");
+        }
+        String resolvedTarget = StringUtils.hasText(createPullRequest.getTargetBranch())
+                ? createPullRequest.getTargetBranch()
+                : repository.getDefaultBranch();
+        if (!StringUtils.hasText(resolvedTarget)) {
+            throw new IllegalArgumentException("targetBranch is required when repository defaultBranch is blank");
+        }
+        if (createPullRequest.getSourceBranch().equals(resolvedTarget)) {
+            throw new IllegalArgumentException("sourceBranch and targetBranch must be different");
+        }
+        return resolvedTarget;
     }
 
     private record FromOrToCommitFilters(String from, String to, String fromType, String toType) {
