@@ -1473,6 +1473,88 @@ class GitOperationImplTest {
         }
     }
 
+    // --- isWorkingTreeClean ---
+
+    /**
+     * Scenario: working tree has no changes.
+     * Verifies: status is queried and true is returned.
+     */
+    @Test
+    void whenIsWorkingTreeCleanAndStatusCleanThenReturnTrue(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.status()).thenReturn(statusCommand);
+        when(statusCommand.call()).thenReturn(status);
+        when(status.isClean()).thenReturn(true);
+
+        assertThat(sut.isWorkingTreeClean(repoDir)).isTrue();
+
+        verify(gitFactory).open(repoDir);
+        verify(status).isClean();
+    }
+
+    /**
+     * Scenario: working tree has changes.
+     * Verifies: status is queried and false is returned.
+     */
+    @Test
+    void whenIsWorkingTreeCleanAndStatusDirtyThenReturnFalse(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.status()).thenReturn(statusCommand);
+        when(statusCommand.call()).thenReturn(status);
+        when(status.isClean()).thenReturn(false);
+
+        assertThat(sut.isWorkingTreeClean(repoDir)).isFalse();
+
+        verify(gitFactory).open(repoDir);
+        verify(status).isClean();
+    }
+
+    // --- getCheckedOutCommitSha ---
+
+    /**
+     * Scenario: HEAD resolves after a tag checkout (detached HEAD).
+     * Verifies: Constants.HEAD is resolved and the SHA is returned.
+     */
+    @Test
+    void whenGetCheckedOutCommitShaOnDetachedHeadThenReturnSha(@TempDir Path tempDir) throws Exception {
+        File repoDir = tempDir.toFile();
+        String expectedSha = "deadbeefcafebabe";
+        ObjectId objectId = mock(ObjectId.class);
+        when(objectId.getName()).thenReturn(expectedSha);
+
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.HEAD)).thenReturn(objectId);
+
+        String result = sut.getCheckedOutCommitSha(repoDir);
+
+        assertThat(result).isEqualTo(expectedSha);
+        verify(gitFactory).open(repoDir);
+        verify(jgitRepository).resolve(Constants.HEAD);
+    }
+
+    /**
+     * Scenario: HEAD cannot be resolved (e.g. unborn repository).
+     * Verifies: GitOperationException with message about currently checked-out commit.
+     */
+    @Test
+    void whenGetCheckedOutCommitShaWithUnresolvableHeadThenThrowGitOperationException(@TempDir Path tempDir)
+            throws Exception {
+        File repoDir = tempDir.toFile();
+        when(gitFactory.open(repoDir)).thenReturn(git);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.resolve(Constants.HEAD)).thenReturn(null);
+
+        assertThatThrownBy(() -> sut.getCheckedOutCommitSha(repoDir))
+                .isInstanceOf(GitOperationException.class)
+                .hasMessageContaining("getCheckedOutCommitSha")
+                .hasMessageContaining("Cannot resolve currently checked-out commit");
+
+        verify(gitFactory).open(repoDir);
+    }
+
     // --- getHeadSha ---
 
     /**

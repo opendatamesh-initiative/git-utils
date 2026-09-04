@@ -232,6 +232,44 @@ public class GitOperationImpl implements GitOperation {
     }
 
     @Override
+    public boolean isWorkingTreeClean(File repoDir) {
+        if (repoDir == null || !repoDir.exists()) {
+            throw new GitOperationException("isWorkingTreeClean", "Valid repository directory is required");
+        }
+
+        try (Git git = gitFactory.open(repoDir)) {
+            return git.status().call().isClean();
+        } catch (IOException | GitAPIException e) {
+            throw new GitOperationException(
+                    "isWorkingTreeClean",
+                    "Failed to read working tree status: " + e.getMessage(),
+                    e);
+        }
+    }
+
+    @Override
+    public String getCheckedOutCommitSha(File repoDir) {
+        if (repoDir == null || !repoDir.exists()) {
+            throw new GitOperationException("getCheckedOutCommitSha", "Valid repository directory is required");
+        }
+
+        try (Git git = gitFactory.open(repoDir)) {
+            ObjectId commitId = git.getRepository().resolve(Constants.HEAD);
+            if (commitId == null) {
+                throw new GitOperationException(
+                        "getCheckedOutCommitSha",
+                        "Cannot resolve currently checked-out commit (HEAD)");
+            }
+            return commitId.getName();
+        } catch (IOException e) {
+            throw new GitOperationException(
+                    "getCheckedOutCommitSha",
+                    "Failed to resolve currently checked-out commit: " + e.getMessage(),
+                    e);
+        }
+    }
+
+    @Override
     public void push(File repoDir, boolean pushTags) {
         if (repoDir == null || !repoDir.exists()) {
             throw new GitOperationException("push", "Valid repository directory is required");

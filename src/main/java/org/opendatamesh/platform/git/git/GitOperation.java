@@ -107,6 +107,46 @@ public interface GitOperation {
     void commit(File repoDir, Commit commit);
 
     /**
+     * Returns whether the working tree and index are clean (no staged or unstaged
+     * changes relative to {@code HEAD}).
+     *
+     * @param repoDir the local repository root directory
+     * @return {@code true} when {@code git status} reports a clean tree
+     * @throws org.opendatamesh.platform.git.exceptions.GitOperationException if
+     *                                                                        the
+     *                                                                        repo
+     *                                                                        is
+     *                                                                        invalid
+     *                                                                        or
+     *                                                                        status
+     *                                                                        cannot
+     *                                                                        be
+     *                                                                        read
+     */
+    boolean isWorkingTreeClean(File repoDir);
+
+    /**
+     * Returns the full SHA of the commit currently checked out ({@code HEAD}).
+     * Works for a branch tip and for detached {@code HEAD} after a tag checkout.
+     * Distinct from {@link #getHeadSha(File, String)}, which resolves a named
+     * branch ref.
+     *
+     * @param repoDir the local repository root directory
+     * @return the full SHA of the currently checked-out commit
+     * @throws org.opendatamesh.platform.git.exceptions.GitOperationException if
+     *                                                                        the
+     *                                                                        repo
+     *                                                                        is
+     *                                                                        invalid
+     *                                                                        or
+     *                                                                        {@code HEAD}
+     *                                                                        cannot
+     *                                                                        be
+     *                                                                        resolved
+     */
+    String getCheckedOutCommitSha(File repoDir);
+
+    /**
      * Creates a local branch from the current {@code HEAD} (including detached
      * HEAD),
      * checks it out, and returns the full tip SHA.
