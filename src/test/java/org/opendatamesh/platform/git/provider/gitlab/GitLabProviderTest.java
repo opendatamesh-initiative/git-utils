@@ -18,6 +18,7 @@ import org.opendatamesh.platform.git.provider.GitProviderCredential;
 import org.opendatamesh.platform.git.provider.gitlab.credentials.GitLabPatCredential;
 import org.opendatamesh.platform.git.provider.gitlab.resources.createmergerequest.GitLabCreateMergeRequestReq;
 import org.opendatamesh.platform.git.provider.gitlab.resources.createmergerequest.GitLabCreateMergeRequestRes;
+import org.opendatamesh.platform.git.provider.gitlab.resources.createrepository.GitLabCreateRepositoryProjectRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.getcurrentuser.GitLabGetCurrentUserUserRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.getorganization.GitLabGetOrganizationGroupRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.getrepository.GitLabGetRepositoryProjectRes;
@@ -116,7 +117,7 @@ class GitLabProviderTest {
         
         // Mock RestTemplate response
         when(restTemplate.exchange(
-                eq(baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&owned={owned}"),
+                eq(baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&min_access_level={minAccessLevel}"),
                 eq(HttpMethod.GET),
                 any(HttpEntity.class),
                 eq(GitLabListOrganizationsGroupRes[].class),
@@ -129,7 +130,7 @@ class GitLabProviderTest {
         // Verify
         assertThat(organizations).isNotNull();
         verify(restTemplate, times(1)).exchange(
-                eq(baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&owned={owned}"),
+                eq(baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&min_access_level={minAccessLevel}"),
                 eq(HttpMethod.GET),
                 any(HttpEntity.class),
                 eq(GitLabListOrganizationsGroupRes[].class),
@@ -630,6 +631,62 @@ class GitLabProviderTest {
                     GitClientException gitEx = (GitClientException) ex;
                     assertThat(gitEx.getCode()).isEqualTo(409);
                     assertThat(gitEx.getResponseBody()).contains("exists");
+                });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void whenListOrganizationsCalledThenGroupsAreFilteredByMembershipNotOwnership() {
+        when(restTemplate.exchange(
+                anyString(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(new GitLabListOrganizationsGroupRes[0], HttpStatus.OK));
+
+        gitLabProvider.listOrganizations(PageRequest.of(1, 50));
+
+        ArgumentCaptor<String> uriCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Map<String, Object>> varsCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(restTemplate).exchange(
+                uriCaptor.capture(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                varsCaptor.capture()
+        );
+        assertThat(uriCaptor.getValue()).doesNotContain("owned");
+        assertThat(uriCaptor.getValue()).contains("min_access_level={minAccessLevel}");
+        assertThat(varsCaptor.getValue())
+                .containsEntry("minAccessLevel", 30)
+                .containsEntry("page", 2)
+                .containsEntry("perPage", 50);
+    }
+
+    @Test
+    void whenCreateRepositoryInGroupIsForbiddenThenClearErrorIsThrown() {
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/v4/projects"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabCreateRepositoryProjectRes.class)
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.FORBIDDEN, "Forbidden",
+                org.springframework.http.HttpHeaders.EMPTY, "{\"message\":\"403 Forbidden\"}".getBytes(), null));
+
+        Repository repository = new Repository();
+        repository.setName("new-repo");
+        repository.setOwnerType(RepositoryOwnerType.ORGANIZATION);
+        repository.setOwnerId("12345");
+
+        assertThatThrownBy(() -> gitLabProvider.createRepository(repository))
+                .isInstanceOf(GitClientException.class)
+                .satisfies(ex -> {
+                    GitClientException gitEx = (GitClientException) ex;
+                    assertThat(gitEx.getCode()).isEqualTo(403);
+                    assertThat(gitEx.getResponseBody())
+                            .contains("not allowed to create projects in group 12345")
+                            .contains("403 Forbidden");
                 });
     }
 
