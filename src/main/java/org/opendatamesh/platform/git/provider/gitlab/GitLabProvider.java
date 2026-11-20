@@ -58,6 +58,11 @@ import java.util.*;
  */
 public class GitLabProvider implements GitProvider {
 
+    /**
+     * GitLab "Developer" access level: the lowest role a group can allow to create projects.
+     */
+    static final int GITLAB_DEVELOPER_ACCESS_LEVEL = 30;
+
     private final String baseUrl;
     private final RestTemplate restTemplate;
     private final GitProviderCredential credential;
@@ -107,11 +112,14 @@ public class GitLabProvider implements GitProvider {
             HttpHeaders headers = credential.createGitProviderHeaders();
             HttpEntity<String> entity = new HttpEntity<>(headers);
 
-            String uriTemplate = baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&owned={owned}";
+            // List the groups the user is a member of with at least the Developer role, which is the
+            // lowest role a GitLab group can allow to create projects. Filtering on owned=true would
+            // hide the groups where the user is Maintainer or Developer.
+            String uriTemplate = baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&min_access_level={minAccessLevel}";
             Map<String, Object> uriVariables = new HashMap<>();
             uriVariables.put("page", page.getPageNumber() + 1);
             uriVariables.put("perPage", page.getPageSize());
-            uriVariables.put("owned", "true");
+            uriVariables.put("minAccessLevel", GITLAB_DEVELOPER_ACCESS_LEVEL);
 
             ResponseEntity<GitLabListOrganizationsGroupRes[]> response = restTemplate.exchange(
                     uriTemplate,
@@ -315,6 +323,13 @@ public class GitLabProvider implements GitProvider {
         return Optional.empty();
     }
 
+    private static String describeNamespace(Repository repository) {
+        if (repository != null && repository.getOwnerType() == RepositoryOwnerType.ORGANIZATION) {
+            return "group " + repository.getOwnerId();
+        }
+        return "the user's personal namespace";
+    }
+
     @Override
     public Repository createRepository(Repository repositoryToCreate) {
         try {
@@ -343,6 +358,13 @@ public class GitLabProvider implements GitProvider {
         } catch (RestClientResponseException e) {
             if (e.getStatusCode().value() == 401) {
                 throw new GitProviderAuthenticationException("GitLab authentication failed with provider. Please check your credentials.");
+            }
+            if (e.getStatusCode().value() == 403) {
+                throw new GitClientException(403,
+                        "GitLab denied the repository creation: the user's role is not allowed to create projects in "
+                                + describeNamespace(repositoryToCreate)
+                                + ". Check the group setting \"Roles allowed to create projects\" or use an account with a higher role. "
+                                + "GitLab response: " + e.getResponseBodyAsString());
             }
             throw new GitClientException(e.getStatusCode().value(),
                     "GitLab request failed to create repository: " + e.getResponseBodyAsString());
