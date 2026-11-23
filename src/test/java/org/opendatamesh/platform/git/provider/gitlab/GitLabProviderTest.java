@@ -26,6 +26,8 @@ import org.opendatamesh.platform.git.provider.gitlab.resources.listbranches.GitL
 import org.opendatamesh.platform.git.provider.gitlab.resources.listcommits.GitLabCompareCommitsRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listcommits.GitLabListCommitsCommitRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listmembers.GitLabListMembersUserRes;
+import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsGraphQlReq;
+import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsGraphQlRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsGroupRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listrepositories.GitLabListRepositoriesProjectRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listtags.GitLabListTagsTagRes;
@@ -123,6 +125,7 @@ class GitLabProviderTest {
                 eq(GitLabListOrganizationsGroupRes[].class),
                 anyMap()
         )).thenReturn(new ResponseEntity<>(groupsRes, HttpStatus.OK));
+        stubGraphQl(graphQlPage(false, null));
 
         // Test
         Page<Organization> organizations = gitLabProvider.listOrganizations(pageable);
@@ -644,6 +647,7 @@ class GitLabProviderTest {
                 eq(GitLabListOrganizationsGroupRes[].class),
                 anyMap()
         )).thenReturn(new ResponseEntity<>(new GitLabListOrganizationsGroupRes[0], HttpStatus.OK));
+        stubGraphQl(graphQlPage(false, null));
 
         gitLabProvider.listOrganizations(PageRequest.of(1, 50));
 
@@ -660,8 +664,318 @@ class GitLabProviderTest {
         assertThat(uriCaptor.getValue()).contains("min_access_level={minAccessLevel}");
         assertThat(varsCaptor.getValue())
                 .containsEntry("minAccessLevel", 30)
-                .containsEntry("page", 2)
-                .containsEntry("perPage", 50);
+                .containsEntry("page", 1)
+                .containsEntry("perPage", 100);
+    }
+
+    @Test
+    void whenListOrganizationsCalledThenSharedGroupsFromGraphQlAreMergedWithMemberGroups() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[]{
+                restGroup(10, "senior-devs", "acme/people/senior-devs"),
+                restGroup(20, "maintainer-only", "acme/people/maintainer-only")
+        });
+        stubGraphQl(graphQlPage(false, null,
+                graphQlGroup(10, "senior-devs", "acme/people/senior-devs"),
+                graphQlGroup(30, "code", "acme/code"),
+                graphQlGroup(31, "pipelines", "acme/code/pipelines"),
+                graphQlGroup(40, "configuration-management", "acme/configuration-management")));
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 100));
+
+        assertThat(organizations.getTotalElements()).isEqualTo(5);
+        assertThat(organizations.getContent())
+                .extracting(Organization::getId)
+                .containsExactly("30", "40", "20", "31", "10");
+        assertThat(organizations.getContent().get(0).getName()).isEqualTo("code");
+        assertThat(organizations.getContent().get(0).getUrl()).isEqualTo("https://gitlab.com/groups/acme/code");
+    }
+
+    @Test
+    void whenListOrganizationsGraphQlReturnsErrorsThenMemberGroupsAreReturned() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[]{restGroup(10, "senior-devs", "acme/people/senior-devs")});
+        GitLabListOrganizationsGraphQlRes.Error error = new GitLabListOrganizationsGraphQlRes.Error();
+        error.setMessage("Field 'groups' doesn't accept argument 'permissionScope'");
+        GitLabListOrganizationsGraphQlRes errorRes = new GitLabListOrganizationsGraphQlRes();
+        errorRes.setErrors(List.of(error));
+        stubGraphQl(errorRes);
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 100));
+
+        assertThat(organizations.getContent()).extracting(Organization::getId).containsExactly("10");
+    }
+
+    @Test
+    void whenListOrganizationsGraphQlRequestFailsThenMemberGroupsAreReturned() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[]{restGroup(10, "senior-devs", "acme/people/senior-devs")});
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.FORBIDDEN, "Forbidden",
+                org.springframework.http.HttpHeaders.EMPTY, "{\"error\":\"insufficient_scope\"}".getBytes(), null));
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 100));
+
+        assertThat(organizations.getContent()).extracting(Organization::getId).containsExactly("10");
+    }
+
+    @Test
+    void whenListOrganizationsGraphQlIsUnauthorizedThenAuthenticationExceptionIsThrown() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[0]);
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.UNAUTHORIZED, "Unauthorized",
+                org.springframework.http.HttpHeaders.EMPTY, new byte[0], null));
+
+        assertThatThrownBy(() -> gitLabProvider.listOrganizations(PageRequest.of(0, 100)))
+                .isInstanceOf(GitProviderAuthenticationException.class);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void whenListOrganizationsCalledThenAllPagesOfBothSourcesAreReadAndTheMergedListIsPaged() {
+        GitLabListOrganizationsGroupRes[] firstRestPage = new GitLabListOrganizationsGroupRes[100];
+        for (int i = 0; i < 100; i++) {
+            firstRestPage[i] = restGroup(1000 + i, String.format("g%03d", i), String.format("acme/g%03d", i));
+        }
+        when(restTemplate.exchange(
+                anyString(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        )).thenAnswer(invocation -> {
+            Map<String, Object> vars = invocation.getArgument(4);
+            GitLabListOrganizationsGroupRes[] body = Integer.valueOf(1).equals(vars.get("page"))
+                    ? firstRestPage
+                    : new GitLabListOrganizationsGroupRes[]{restGroup(2000, "z-last", "acme/z-last")};
+            return new ResponseEntity<>(body, HttpStatus.OK);
+        });
+        ResponseEntity<GitLabListOrganizationsGraphQlRes> graphQlFirstPage = new ResponseEntity<>(
+                graphQlPage(true, "cursor-1", graphQlGroup(3000, "shared-a", "other/shared-a")), HttpStatus.OK);
+        ResponseEntity<GitLabListOrganizationsGraphQlRes> graphQlSecondPage = new ResponseEntity<>(
+                graphQlPage(false, null, graphQlGroup(3001, "shared-b", "other/shared-b")), HttpStatus.OK);
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        )).thenReturn(
+                graphQlFirstPage, graphQlSecondPage, graphQlFirstPage, graphQlSecondPage);
+
+        Page<Organization> secondPage = gitLabProvider.listOrganizations(PageRequest.of(1, 50));
+
+        assertThat(secondPage.getTotalElements()).isEqualTo(103);
+        assertThat(secondPage.getContent()).hasSize(50);
+        assertThat(secondPage.getContent().get(0).getId()).isEqualTo("1050");
+
+        Page<Organization> lastPage = gitLabProvider.listOrganizations(PageRequest.of(2, 50));
+        assertThat(lastPage.getContent()).extracting(Organization::getId).containsExactly("3000", "3001", "2000");
+
+        // The REST source stops after its short second page: two GETs per listOrganizations call.
+        verify(restTemplate, times(4)).exchange(
+                anyString(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        );
+
+        ArgumentCaptor<HttpEntity<GitLabListOrganizationsGraphQlReq>> graphQlRequests = ArgumentCaptor.forClass(HttpEntity.class);
+        verify(restTemplate, times(4)).exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                graphQlRequests.capture(),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        );
+        assertThat(graphQlRequests.getAllValues().get(0).getBody().getQuery()).contains("permissionScope: CREATE_PROJECTS");
+        assertThat(graphQlRequests.getAllValues().get(0).getBody().getVariables()).containsEntry("after", null);
+        assertThat(graphQlRequests.getAllValues().get(1).getBody().getVariables()).containsEntry("after", "cursor-1");
+    }
+
+    @Test
+    void whenListOrganizationsFindsGroupsWithTheSameNameThenFullPathBreaksTheTie() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[]{
+                restGroup(10, "code", "zeta/code"),
+                restGroup(11, "Alpha", "zeta/alpha")
+        });
+        stubGraphQl(graphQlPage(false, null, graphQlGroup(20, "code", "acme/code")));
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 100));
+
+        assertThat(organizations.getContent()).extracting(Organization::getId).containsExactly("11", "20", "10");
+    }
+
+    @Test
+    void whenListOrganizationsGetsGroupsWithoutNameOrFullPathOrUnpagedThenAllAreReturned() {
+        GitLabListOrganizationsGroupRes noName = restGroup(10, null, null);
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[]{restGroup(11, "beta", null), noName});
+        stubGraphQl(graphQlPage(false, null));
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(Pageable.unpaged());
+
+        assertThat(organizations.getTotalElements()).isEqualTo(2);
+        assertThat(organizations.getContent()).extracting(Organization::getId).containsExactly("10", "11");
+    }
+
+    @Test
+    void whenListOrganizationsGetsGraphQlGroupsWithInvalidIdsThenTheyAreSkipped() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[0]);
+        GitLabListOrganizationsGraphQlRes.Group invalidId = graphQlGroup(1, "invalid", "acme/invalid");
+        invalidId.setId("gid://gitlab/Group/abc");
+        GitLabListOrganizationsGraphQlRes.Group nullId = graphQlGroup(2, "null-id", "acme/null-id");
+        nullId.setId(null);
+        stubGraphQl(graphQlPage(false, null, invalidId, nullId, graphQlGroup(3, "valid", "acme/valid")));
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 100));
+
+        assertThat(organizations.getContent()).extracting(Organization::getId).containsExactly("3");
+    }
+
+    @Test
+    void whenListOrganizationsGraphQlSecondPageFailsThenFirstPageGroupsAreKept() {
+        stubMemberGroups(new GitLabListOrganizationsGroupRes[0]);
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        ))
+                .thenReturn(new ResponseEntity<>(graphQlPage(true, "cursor-1", graphQlGroup(30, "code", "acme/code")), HttpStatus.OK))
+                .thenThrow(HttpClientErrorException.create(HttpStatus.BAD_GATEWAY, "Bad Gateway",
+                        org.springframework.http.HttpHeaders.EMPTY, "<html>bad gateway</html>".getBytes(), null));
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 100));
+
+        assertThat(organizations.getContent()).extracting(Organization::getId).containsExactly("30");
+    }
+
+    @Test
+    void whenListOrganizationsRestRequestFailsThenErrorIsThrownAndGraphQlIsNotCalled() {
+        when(restTemplate.exchange(
+                anyString(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        )).thenThrow(HttpClientErrorException.create(HttpStatus.INTERNAL_SERVER_ERROR, "Server Error",
+                org.springframework.http.HttpHeaders.EMPTY, "{\"message\":\"boom\"}".getBytes(), null));
+
+        assertThatThrownBy(() -> gitLabProvider.listOrganizations(PageRequest.of(0, 100)))
+                .isInstanceOf(GitClientException.class)
+                .satisfies(ex -> assertThat(((GitClientException) ex).getCode()).isEqualTo(500));
+        verify(restTemplate, never()).exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        );
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void whenListOrganizationsSourcesKeepReturningFullPagesThenReadingStopsAtThePageCap() {
+        int[] nextRestId = {0};
+        when(restTemplate.exchange(
+                anyString(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        )).thenAnswer(invocation -> {
+            GitLabListOrganizationsGroupRes[] body = new GitLabListOrganizationsGroupRes[GitLabProvider.ORGANIZATIONS_FETCH_PAGE_SIZE];
+            for (int i = 0; i < body.length; i++) {
+                int id = nextRestId[0]++;
+                body[i] = restGroup(id, "g" + id, "acme/g" + id);
+            }
+            return new ResponseEntity<>(body, HttpStatus.OK);
+        });
+        int[] nextGraphQlId = {100_000};
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        )).thenAnswer(invocation -> {
+            int id = nextGraphQlId[0]++;
+            return new ResponseEntity<>(graphQlPage(true, "cursor-" + id, graphQlGroup(id, "s" + id, "other/s" + id)), HttpStatus.OK);
+        });
+
+        Page<Organization> organizations = gitLabProvider.listOrganizations(PageRequest.of(0, 10));
+
+        int cap = GitLabProvider.ORGANIZATIONS_MAX_FETCHED_PAGES;
+        assertThat(organizations.getTotalElements()).isEqualTo((long) cap * GitLabProvider.ORGANIZATIONS_FETCH_PAGE_SIZE + cap);
+        verify(restTemplate, times(cap)).exchange(
+                anyString(),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        );
+        verify(restTemplate, times(cap)).exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        );
+    }
+
+    private void stubMemberGroups(GitLabListOrganizationsGroupRes[] groups) {
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&min_access_level={minAccessLevel}"),
+                eq(HttpMethod.GET),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGroupRes[].class),
+                anyMap()
+        )).thenReturn(new ResponseEntity<>(groups, HttpStatus.OK));
+    }
+
+    private void stubGraphQl(GitLabListOrganizationsGraphQlRes res) {
+        when(restTemplate.exchange(
+                eq(baseUrl + "/api/graphql"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(GitLabListOrganizationsGraphQlRes.class)
+        )).thenReturn(new ResponseEntity<>(res, HttpStatus.OK));
+    }
+
+    private static GitLabListOrganizationsGroupRes restGroup(long id, String name, String fullPath) {
+        GitLabListOrganizationsGroupRes group = new GitLabListOrganizationsGroupRes();
+        group.setId(id);
+        group.setName(name);
+        group.setFullPath(fullPath);
+        group.setWebUrl("https://gitlab.com/groups/" + fullPath);
+        return group;
+    }
+
+    private static GitLabListOrganizationsGraphQlRes.Group graphQlGroup(long id, String name, String fullPath) {
+        GitLabListOrganizationsGraphQlRes.Group group = new GitLabListOrganizationsGraphQlRes.Group();
+        group.setId("gid://gitlab/Group/" + id);
+        group.setName(name);
+        group.setFullPath(fullPath);
+        group.setWebUrl("https://gitlab.com/groups/" + fullPath);
+        return group;
+    }
+
+    private static GitLabListOrganizationsGraphQlRes graphQlPage(boolean hasNextPage, String endCursor,
+                                                               GitLabListOrganizationsGraphQlRes.Group... groups) {
+        GitLabListOrganizationsGraphQlRes.PageInfo pageInfo = new GitLabListOrganizationsGraphQlRes.PageInfo();
+        pageInfo.setHasNextPage(hasNextPage);
+        pageInfo.setEndCursor(endCursor);
+        GitLabListOrganizationsGraphQlRes.GroupConnection connection = new GitLabListOrganizationsGraphQlRes.GroupConnection();
+        connection.setNodes(List.of(groups));
+        connection.setPageInfo(pageInfo);
+        GitLabListOrganizationsGraphQlRes.CurrentUser currentUser = new GitLabListOrganizationsGraphQlRes.CurrentUser();
+        currentUser.setGroups(connection);
+        GitLabListOrganizationsGraphQlRes.Data data = new GitLabListOrganizationsGraphQlRes.Data();
+        data.setCurrentUser(currentUser);
+        GitLabListOrganizationsGraphQlRes res = new GitLabListOrganizationsGraphQlRes();
+        res.setData(data);
+        return res;
     }
 
     @Test
