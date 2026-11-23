@@ -78,6 +78,8 @@ public class GitLabProvider implements GitProvider {
      */
     static final int ORGANIZATIONS_MAX_FETCHED_PAGES = 20;
 
+    private static final int LOGGED_RESPONSE_MAX_LENGTH = 500;
+
     private static final Logger logger = LoggerFactory.getLogger(GitLabProvider.class);
 
     private final String baseUrl;
@@ -138,18 +140,20 @@ public class GitLabProvider implements GitProvider {
         for (GitLabListOrganizationsGroupRes groupResponse : fetchMemberGroups()) {
             Organization org = GitLabListOrganizationsMapper.toInternalModel(groupResponse);
             if (org != null) {
-                organizationsById.putIfAbsent(org.getId(), new SortableOrganization(sortKey(groupResponse.getFullPath(), org), org));
+                organizationsById.putIfAbsent(org.getId(), new SortableOrganization(groupResponse.getFullPath(), org));
             }
         }
         for (GitLabListOrganizationsGraphQlRes.Group group : fetchGroupsAcceptingProjectCreation()) {
             Organization org = GitLabListOrganizationsMapper.toInternalModel(group);
             if (org != null) {
-                organizationsById.putIfAbsent(org.getId(), new SortableOrganization(sortKey(group.getFullPath(), org), org));
+                organizationsById.putIfAbsent(org.getId(), new SortableOrganization(group.getFullPath(), org));
             }
         }
 
+        // Sorted by the name callers display, with the full path breaking ties between same-named groups.
         List<Organization> organizations = organizationsById.values().stream()
-                .sorted(Comparator.comparing(SortableOrganization::sortKey, String.CASE_INSENSITIVE_ORDER))
+                .sorted(Comparator.comparing(SortableOrganization::name, String.CASE_INSENSITIVE_ORDER)
+                        .thenComparing(SortableOrganization::fullPath, String.CASE_INSENSITIVE_ORDER))
                 .map(SortableOrganization::organization)
                 .toList();
 
@@ -161,14 +165,14 @@ public class GitLabProvider implements GitProvider {
         return new PageImpl<>(organizations.subList(from, to), page, organizations.size());
     }
 
-    private record SortableOrganization(String sortKey, Organization organization) {
-    }
-
-    private static String sortKey(String fullPath, Organization org) {
-        if (StringUtils.hasText(fullPath)) {
-            return fullPath;
+    private record SortableOrganization(String fullPath, Organization organization) {
+        SortableOrganization {
+            fullPath = fullPath != null ? fullPath : "";
         }
-        return org.getName() != null ? org.getName() : "";
+
+        String name() {
+            return organization.getName() != null ? organization.getName() : "";
+        }
     }
 
     /**
@@ -203,6 +207,10 @@ public class GitLabProvider implements GitProvider {
                 groups.addAll(Arrays.asList(groupResponses));
                 if (groupResponses.length < ORGANIZATIONS_FETCH_PAGE_SIZE) {
                     break;
+                }
+                if (pageNumber == ORGANIZATIONS_MAX_FETCHED_PAGES) {
+                    logger.warn("GitLab member groups: stopped after {} pages ({} groups); further groups, if any, are not listed",
+                            ORGANIZATIONS_MAX_FETCHED_PAGES, groups.size());
                 }
             }
             return groups;
@@ -264,6 +272,11 @@ public class GitLabProvider implements GitProvider {
                 if (pageInfo == null || !pageInfo.isHasNextPage() || !StringUtils.hasText(pageInfo.getEndCursor())) {
                     break;
                 }
+                if (pageNumber == ORGANIZATIONS_MAX_FETCHED_PAGES) {
+                    logger.warn("GitLab groups accepting project creation: stopped after {} pages ({} groups); further groups are not listed",
+                            ORGANIZATIONS_MAX_FETCHED_PAGES, groups.size());
+                    break;
+                }
                 after = pageInfo.getEndCursor();
             }
         } catch (RestClientResponseException e) {
@@ -271,11 +284,21 @@ public class GitLabProvider implements GitProvider {
                 throw new GitProviderAuthenticationException("GitLab authentication failed with provider. Please check your credentials.");
             }
             logger.warn("GitLab GraphQL query for groups accepting project creation failed with status {}: {}",
-                    e.getStatusCode().value(), e.getResponseBodyAsString());
+                    e.getStatusCode().value(), abbreviate(e.getResponseBodyAsString()));
         } catch (RestClientException e) {
             logger.warn("GitLab GraphQL query for groups accepting project creation failed: {}", e.getMessage());
         }
         return groups;
+    }
+
+    /**
+     * Shortens a response body for logging: when GraphQL is disabled or behind a proxy it can be a whole HTML page.
+     */
+    private static String abbreviate(String text) {
+        if (text == null || text.length() <= LOGGED_RESPONSE_MAX_LENGTH) {
+            return text;
+        }
+        return text.substring(0, LOGGED_RESPONSE_MAX_LENGTH) + "... (truncated)";
     }
 
     @Override

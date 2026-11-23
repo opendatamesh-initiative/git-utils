@@ -20,7 +20,7 @@ public class GitLabListOrganizationsGraphQlReq {
             + " pageInfo { hasNextPage endCursor }"
             + " } } }";
 
-    private final String query = QUERY;
+    // HashMap rather than Map.of: "after" is null on the first page.
     private final Map<String, Object> variables = new HashMap<>();
 
     public GitLabListOrganizationsGraphQlReq(int first, String after) {
@@ -29,7 +29,7 @@ public class GitLabListOrganizationsGraphQlReq {
     }
 
     public String getQuery() {
-        return query;
+        return QUERY;
     }
 
     public Map<String, Object> getVariables() {
