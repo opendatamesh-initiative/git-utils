@@ -926,12 +926,34 @@ public class GitOperationImpl implements GitOperation {
         }
 
         try (Git git = cloneCommand.call()) {
-            // If it's a completely empty repo, initialize it with an orphan branch
+            // If it's a completely empty repo, leave HEAD on the requested (unborn) branch
             if (isEmptyRepo) {
-                git.checkout().setOrphan(true).setName(cleanName).call();
+                pointHeadAtUnbornBranch(git.getRepository(), exactRefPath);
             }
             // (If the ref existed, JGit automatically checked it out during the shallow
             // clone)
+        } catch (IOException e) {
+            throw new GitOperationException("readRepository",
+                    String.format("Failed to point HEAD at branch '%s' of the empty repository: %s",
+                            cleanName, e.getMessage()), e);
+        }
+    }
+
+    /**
+     * Points HEAD of a freshly cloned empty repository at the requested unborn branch.
+     * <p>
+     * The clone's initial HEAD comes from the runtime git configuration ({@code init.defaultBranch},
+     * else {@code master}), so it may already be the requested branch. An orphan checkout would then
+     * fail with {@code NO_CHANGE}; linking HEAD directly treats that case as already done.
+     */
+    private void pointHeadAtUnbornBranch(org.eclipse.jgit.lib.Repository repository, String branchRef)
+            throws IOException {
+        RefUpdate.Result result = repository.updateRef(Constants.HEAD).link(branchRef);
+        if (result != RefUpdate.Result.NEW
+                && result != RefUpdate.Result.FORCED
+                && result != RefUpdate.Result.NO_CHANGE) {
+            throw new GitOperationException("readRepository",
+                    String.format("Cannot point HEAD at '%s': %s", branchRef, result.name()));
         }
     }
 

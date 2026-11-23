@@ -6,6 +6,7 @@ import org.eclipse.jgit.api.errors.TransportException;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
@@ -19,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -35,7 +37,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -255,14 +259,18 @@ class GitOperationImplTest {
         when(cloneCommand.setBranch(anyString())).thenReturn(cloneCommand);
         when(cloneCommand.setDepth(anyInt())).thenReturn(cloneCommand);
         when(cloneCommand.call()).thenReturn(git);
-        when(git.checkout()).thenReturn(checkoutCommand);
-        when(checkoutCommand.setOrphan(anyBoolean())).thenReturn(checkoutCommand);
-        when(checkoutCommand.setName(anyString())).thenReturn(checkoutCommand);
+        RefUpdate headUpdate = mock(RefUpdate.class);
+        when(git.getRepository()).thenReturn(jgitRepository);
+        when(jgitRepository.updateRef(Constants.HEAD)).thenReturn(headUpdate);
+        when(headUpdate.link(Constants.R_HEADS + "main")).thenReturn(RefUpdate.Result.NEW);
 
         // When
         sut.readRepository(repo, pointer, consumer);
 
-        // Then: shallow clone is used but setBranchesToClone must not be called (ref does not exist)
+        // Then: HEAD is linked to the requested branch without an orphan checkout
+        verify(headUpdate).link(Constants.R_HEADS + "main");
+        verify(git, never()).checkout();
+        // And: shallow clone is used but setBranchesToClone must not be called (ref does not exist)
         assertThat(capturedDir.get()).isNotNull();
         verify(gitFactory).lsRemoteRepository();
         verify(gitFactory).cloneRepository();
@@ -1707,6 +1715,101 @@ class GitOperationImplTest {
                 .setUri(new URIish(bareRemote.toUri().toString()))
                 .call();
         return local;
+    }
+
+    // --- empty remote repositories and default branch names ---
+
+    /**
+     * Branch names covering both common defaults plus whatever this runtime's git configuration
+     * picks for a new repository ({@code init.defaultBranch}, else {@code master}), so the case where
+     * the requested branch equals the clone's initial HEAD is always exercised.
+     */
+    static Set<String> emptyRemoteBranchNames() throws Exception {
+        Set<String> names = new LinkedHashSet<>(List.of("main", "master", "develop"));
+        Path probe = Files.createTempDirectory("git-default-branch-probe-");
+        try (Git git = Git.init().setDirectory(probe.toFile()).call()) {
+            names.add(git.getRepository().getBranch());
+        } finally {
+            try (var paths = Files.walk(probe)) {
+                paths.sorted(java.util.Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+            }
+        }
+        return names;
+    }
+
+    /*
+     * Scenario: EMPTY-001 Open an empty remote on any branch name
+     *   Given a real empty bare origin
+     *   When readRepository is called with a branch pointer for <branch>
+     *   Then the consumer receives a clone whose HEAD is the unborn "refs/heads/<branch>"
+     *   Including when <branch> equals the runtime default branch of a new repository
+     */
+    @ParameterizedTest
+    @MethodSource("emptyRemoteBranchNames")
+    void empty001_readEmptyRemoteOnAnyBranchName(String branch, @TempDir Path tempDir) throws Exception {
+        org.opendatamesh.platform.git.model.Repository repo = emptyBareOrigin(tempDir);
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        AtomicReference<String> headTarget = new AtomicReference<>();
+        AtomicReference<ObjectId> headId = new AtomicReference<>();
+
+        realSut.readRepository(repo, new RepositoryPointerBranch(branch), dir -> {
+            try (Git git = Git.open(dir)) {
+                headTarget.set(git.getRepository().exactRef(Constants.HEAD).getTarget().getName());
+                headId.set(git.getRepository().resolve(Constants.HEAD));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        assertThat(headTarget.get()).isEqualTo(Constants.R_HEADS + branch);
+        assertThat(headId.get()).isNull();
+    }
+
+    /*
+     * Scenario: EMPTY-002 Populate an empty remote the way blueprint instantiation does
+     *   Given a real empty bare origin
+     *   When the target is opened on <branch>, content is committed on a pure orphan checkpoint branch,
+     *     merged into <branch> and <branch> is pushed
+     *   Then origin has "refs/heads/<branch>" at the checkpoint commit with the rendered file
+     */
+    @ParameterizedTest
+    @MethodSource("emptyRemoteBranchNames")
+    void empty002_populateEmptyRemoteLikeBlueprintInstantiation(String branch, @TempDir Path tempDir)
+            throws Exception {
+        org.opendatamesh.platform.git.model.Repository repo = emptyBareOrigin(tempDir);
+        Path barePath = tempDir.resolve("origin.git");
+        GitOperationImpl realSut = new GitOperationImpl(credential, new JGitFactory());
+        String checkpointBranch = "odm-init/checkpoint";
+        AtomicReference<String> pushedSha = new AtomicReference<>();
+
+        realSut.readRepository(repo, new RepositoryPointerBranch(branch), dir -> {
+            try {
+                realSut.createAndCheckoutOrphanBranch(dir, checkpointBranch);
+                Files.writeString(dir.toPath().resolve("README.md"), "rendered from blueprint");
+                realSut.add(dir, AddMode.ALL);
+                realSut.commit(dir, new Commit("Populate repository", "Blueprint", "blueprint@example.com"));
+                pushedSha.set(realSut.mergeBranch(dir, checkpointBranch, branch));
+                realSut.pushBranch(dir, branch);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        try (Git bare = Git.open(barePath.toFile())) {
+            Ref remoteBranch = bare.getRepository().exactRef(Constants.R_HEADS + branch);
+            assertThat(remoteBranch).isNotNull();
+            assertThat(remoteBranch.getObjectId().getName()).isEqualTo(pushedSha.get());
+            assertThat(bare.getRepository().exactRef(Constants.R_HEADS + checkpointBranch)).isNull();
+        }
+    }
+
+    private org.opendatamesh.platform.git.model.Repository emptyBareOrigin(Path tempDir) throws Exception {
+        Path barePath = tempDir.resolve("origin.git");
+        Git.init().setDirectory(barePath.toFile()).setBare(true).call().close();
+        org.opendatamesh.platform.git.model.Repository repo = validRepository();
+        repo.setCloneUrlHttp(barePath.toUri().toString());
+        repo.setRemoteUrl(barePath.toUri().toString());
+        return repo;
     }
 
     private void commitAll(Git local, String message) throws Exception {
