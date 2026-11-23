@@ -1,6 +1,7 @@
 package org.opendatamesh.platform.git.provider.azure.resources.createrepository;
 
 import org.opendatamesh.platform.git.model.RepositoryOwnerType;
+import org.opendatamesh.platform.git.provider.azure.AzureRefNames;
 import org.opendatamesh.platform.git.model.Repository;
 import org.opendatamesh.platform.git.model.RepositoryVisibility;
 
@@ -17,7 +18,7 @@ public abstract class AzureCreateRepositoryMapper {
                 repoRes.getDescription(),
                 repoRes.getRemoteUrl(),
                 null,
-                repoRes.getDefaultBranch(),
+                AzureRefNames.toShortBranchName(repoRes.getDefaultBranch()),
                 RepositoryOwnerType.ORGANIZATION,
                         projectId,
                 RepositoryVisibility.PRIVATE // Azure DevOps repos are always private

@@ -3,7 +3,7 @@
     {
       "id": "test-repo-id",
       "name": "test-repo",
-      "defaultBranch": "main",
+      "defaultBranch": "refs/heads/main",
       "remoteUrl": "https://dev.azure.com/test/test-repo"
     }
   ]

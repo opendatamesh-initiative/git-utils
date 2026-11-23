@@ -180,6 +180,8 @@ class AzureDevOpsProviderTest {
 
         // Verify
         assertThat(repositories).isNotNull();
+        assertThat(repositories.getContent()).isNotEmpty()
+                .allSatisfy(repo -> assertThat(repo.getDefaultBranch()).doesNotStartWith("refs/heads/"));
         verify(restTemplate, atLeastOnce()).exchange(
                 eq(baseUrl + "/_apis/projects?api-version=7.1"),
                 eq(HttpMethod.GET),
@@ -224,6 +226,8 @@ class AzureDevOpsProviderTest {
         // Verify
         assertThat(repository).isPresent();
         assertThat(repository.get().getName()).isNotNull();
+        // Azure reports refs/heads/main; the model exposes the short name like the other providers
+        assertThat(repository.get().getDefaultBranch()).isEqualTo("main");
         verify(restTemplate, atLeastOnce()).exchange(
                 eq(baseUrl + "/_apis/projects?api-version=7.1"),
                 eq(HttpMethod.GET),
