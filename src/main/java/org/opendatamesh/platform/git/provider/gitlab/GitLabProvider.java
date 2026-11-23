@@ -28,18 +28,23 @@ import org.opendatamesh.platform.git.provider.gitlab.resources.listcommits.GitLa
 import org.opendatamesh.platform.git.provider.gitlab.resources.listcommits.GitLabListCommitsMapper;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listmembers.GitLabListMembersMapper;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listmembers.GitLabListMembersUserRes;
+import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsGraphQlReq;
+import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsGraphQlRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsGroupRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listorganizations.GitLabListOrganizationsMapper;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listrepositories.GitLabListRepositoriesMapper;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listrepositories.GitLabListRepositoriesProjectRes;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listtags.GitLabListTagsMapper;
 import org.opendatamesh.platform.git.provider.gitlab.resources.listtags.GitLabListTagsTagRes;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.MultiValueMap;
 import org.springframework.util.StringUtils;
@@ -62,6 +67,18 @@ public class GitLabProvider implements GitProvider {
      * GitLab "Developer" access level: the lowest role a group can allow to create projects.
      */
     static final int GITLAB_DEVELOPER_ACCESS_LEVEL = 30;
+
+    /**
+     * Page size used when reading all the groups from GitLab (100 is GitLab's maximum).
+     */
+    static final int ORGANIZATIONS_FETCH_PAGE_SIZE = 100;
+
+    /**
+     * Upper bound on the pages read from each source when listing organizations (so at most 2000 groups each).
+     */
+    static final int ORGANIZATIONS_MAX_FETCHED_PAGES = 20;
+
+    private static final Logger logger = LoggerFactory.getLogger(GitLabProvider.class);
 
     private final String baseUrl;
     private final RestTemplate restTemplate;
@@ -108,39 +125,87 @@ public class GitLabProvider implements GitProvider {
 
     @Override
     public Page<Organization> listOrganizations(Pageable page) {
+        // Two sources, merged by group ID:
+        // 1. REST: the groups the user is a direct member of with at least the Developer role, plus their
+        //    subgroups. This is the list we always returned, kept so that pickers of existing repositories don't
+        //    lose groups where the user is Developer but only Maintainers can create projects.
+        // 2. GraphQL CREATE_PROJECTS: the groups where the user can create projects, including the groups
+        //    reached through group sharing ("invited groups") and their subgroups, which the REST filter
+        //    min_access_level leaves out (BDMD-5775). Optional: on older GitLab or when it fails we fall back
+        //    to the REST list alone.
+        // Both sources are read in full and the merged list is paged here, because the two can't be paged together.
+        Map<String, SortableOrganization> organizationsById = new LinkedHashMap<>();
+        for (GitLabListOrganizationsGroupRes groupResponse : fetchMemberGroups()) {
+            Organization org = GitLabListOrganizationsMapper.toInternalModel(groupResponse);
+            if (org != null) {
+                organizationsById.putIfAbsent(org.getId(), new SortableOrganization(sortKey(groupResponse.getFullPath(), org), org));
+            }
+        }
+        for (GitLabListOrganizationsGraphQlRes.Group group : fetchGroupsAcceptingProjectCreation()) {
+            Organization org = GitLabListOrganizationsMapper.toInternalModel(group);
+            if (org != null) {
+                organizationsById.putIfAbsent(org.getId(), new SortableOrganization(sortKey(group.getFullPath(), org), org));
+            }
+        }
+
+        List<Organization> organizations = organizationsById.values().stream()
+                .sorted(Comparator.comparing(SortableOrganization::sortKey, String.CASE_INSENSITIVE_ORDER))
+                .map(SortableOrganization::organization)
+                .toList();
+
+        if (page.isUnpaged()) {
+            return new PageImpl<>(organizations, page, organizations.size());
+        }
+        int from = (int) Math.min(page.getOffset(), organizations.size());
+        int to = Math.min(from + page.getPageSize(), organizations.size());
+        return new PageImpl<>(organizations.subList(from, to), page, organizations.size());
+    }
+
+    private record SortableOrganization(String sortKey, Organization organization) {
+    }
+
+    private static String sortKey(String fullPath, Organization org) {
+        if (StringUtils.hasText(fullPath)) {
+            return fullPath;
+        }
+        return org.getName() != null ? org.getName() : "";
+    }
+
+    /**
+     * Reads all pages of {@code GET /groups?min_access_level=30}, up to {@link #ORGANIZATIONS_MAX_FETCHED_PAGES} pages.
+     */
+    private List<GitLabListOrganizationsGroupRes> fetchMemberGroups() {
         try {
             HttpHeaders headers = credential.createGitProviderHeaders();
             HttpEntity<String> entity = new HttpEntity<>(headers);
 
-            // List the groups the user is a member of with at least the Developer role, which is the
-            // lowest role a GitLab group can allow to create projects. Filtering on owned=true would
-            // hide the groups where the user is Maintainer or Developer.
+            // Filtering on owned=true would hide the groups where the user is Maintainer or Developer.
             String uriTemplate = baseUrl + "/api/v4/groups?page={page}&per_page={perPage}&min_access_level={minAccessLevel}";
-            Map<String, Object> uriVariables = new HashMap<>();
-            uriVariables.put("page", page.getPageNumber() + 1);
-            uriVariables.put("perPage", page.getPageSize());
-            uriVariables.put("minAccessLevel", GITLAB_DEVELOPER_ACCESS_LEVEL);
+            List<GitLabListOrganizationsGroupRes> groups = new ArrayList<>();
+            for (int pageNumber = 1; pageNumber <= ORGANIZATIONS_MAX_FETCHED_PAGES; pageNumber++) {
+                Map<String, Object> uriVariables = new HashMap<>();
+                uriVariables.put("page", pageNumber);
+                uriVariables.put("perPage", ORGANIZATIONS_FETCH_PAGE_SIZE);
+                uriVariables.put("minAccessLevel", GITLAB_DEVELOPER_ACCESS_LEVEL);
 
-            ResponseEntity<GitLabListOrganizationsGroupRes[]> response = restTemplate.exchange(
-                    uriTemplate,
-                    HttpMethod.GET,
-                    entity,
-                    GitLabListOrganizationsGroupRes[].class,
-                    uriVariables
-            );
+                ResponseEntity<GitLabListOrganizationsGroupRes[]> response = restTemplate.exchange(
+                        uriTemplate,
+                        HttpMethod.GET,
+                        entity,
+                        GitLabListOrganizationsGroupRes[].class,
+                        uriVariables
+                );
 
-            List<Organization> organizations = new ArrayList<>();
-            GitLabListOrganizationsGroupRes[] groupResponses = response.getBody();
-            if (groupResponses != null) {
-                for (GitLabListOrganizationsGroupRes groupResponse : groupResponses) {
-                    Organization org = GitLabListOrganizationsMapper.toInternalModel(groupResponse);
-                    if (org != null) {
-                        organizations.add(org);
-                    }
+                GitLabListOrganizationsGroupRes[] groupResponses = response != null ? response.getBody() : null;
+                if (groupResponses == null || groupResponses.length == 0) {
+                    break;
+                }
+                groups.addAll(Arrays.asList(groupResponses));
+                if (groupResponses.length < ORGANIZATIONS_FETCH_PAGE_SIZE) {
+                    break;
                 }
             }
-
-            return new PageImpl<>(organizations, page, organizations.size());
+            return groups;
         } catch (RestClientResponseException e) {
             if (e.getStatusCode().value() == 401) {
                 throw new GitProviderAuthenticationException("GitLab authentication failed with provider. Please check your credentials.");
@@ -150,6 +215,67 @@ public class GitLabProvider implements GitProvider {
         } catch (RestClientException e) {
             throw new GitClientException(500, "GitLab request failed to list organizations: " + e.getMessage());
         }
+    }
+
+    /**
+     * Reads all pages of the GraphQL {@code currentUser.groups(permissionScope: CREATE_PROJECTS)} query, up to
+     * {@link #ORGANIZATIONS_MAX_FETCHED_PAGES} pages. Returns what was read so far (possibly nothing) when the query
+     * fails, e.g. on GitLab older than 15.11, with GraphQL disabled or with a token lacking the read_api scope.
+     */
+    private List<GitLabListOrganizationsGraphQlRes.Group> fetchGroupsAcceptingProjectCreation() {
+        List<GitLabListOrganizationsGraphQlRes.Group> groups = new ArrayList<>();
+        try {
+            HttpHeaders headers = credential.createGitProviderHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            String after = null;
+            for (int pageNumber = 1; pageNumber <= ORGANIZATIONS_MAX_FETCHED_PAGES; pageNumber++) {
+                HttpEntity<GitLabListOrganizationsGraphQlReq> entity = new HttpEntity<>(
+                        new GitLabListOrganizationsGraphQlReq(ORGANIZATIONS_FETCH_PAGE_SIZE, after), headers);
+
+                ResponseEntity<GitLabListOrganizationsGraphQlRes> response = restTemplate.exchange(
+                        baseUrl + "/api/graphql",
+                        HttpMethod.POST,
+                        entity,
+                        GitLabListOrganizationsGraphQlRes.class
+                );
+
+                GitLabListOrganizationsGraphQlRes body = response != null ? response.getBody() : null;
+                if (body == null) {
+                    logger.warn("GitLab GraphQL query for groups accepting project creation returned no body");
+                    break;
+                }
+                if (body.getErrors() != null && !body.getErrors().isEmpty()) {
+                    logger.warn("GitLab GraphQL query for groups accepting project creation failed: {}",
+                            body.getErrors().stream().map(GitLabListOrganizationsGraphQlRes.Error::getMessage).toList());
+                    break;
+                }
+                GitLabListOrganizationsGraphQlRes.GroupConnection connection = body.getData() != null
+                        && body.getData().getCurrentUser() != null
+                        ? body.getData().getCurrentUser().getGroups()
+                        : null;
+                if (connection == null) {
+                    break;
+                }
+                if (connection.getNodes() != null) {
+                    groups.addAll(connection.getNodes());
+                }
+                GitLabListOrganizationsGraphQlRes.PageInfo pageInfo = connection.getPageInfo();
+                if (pageInfo == null || !pageInfo.isHasNextPage() || !StringUtils.hasText(pageInfo.getEndCursor())) {
+                    break;
+                }
+                after = pageInfo.getEndCursor();
+            }
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 401) {
+                throw new GitProviderAuthenticationException("GitLab authentication failed with provider. Please check your credentials.");
+            }
+            logger.warn("GitLab GraphQL query for groups accepting project creation failed with status {}: {}",
+                    e.getStatusCode().value(), e.getResponseBodyAsString());
+        } catch (RestClientException e) {
+            logger.warn("GitLab GraphQL query for groups accepting project creation failed: {}", e.getMessage());
+        }
+        return groups;
     }
 
     @Override

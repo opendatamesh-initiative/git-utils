@@ -15,5 +15,21 @@ public abstract class GitLabListOrganizationsMapper {
                 groupRes.getWebUrl()
         );
     }
+
+    /**
+     * Maps a GraphQL group. Its global ID ({@code gid://gitlab/Group/123}) is reduced to the numeric ID that the
+     * REST API (and so the rest of this provider) uses. Returns null when the ID can't be parsed.
+     */
+    public static Organization toInternalModel(GitLabListOrganizationsGraphQlRes.Group group) {
+        if (group == null || group.getId() == null) {
+            return null;
+        }
+        String id = group.getId().substring(group.getId().lastIndexOf('/') + 1);
+        if (id.isEmpty() || !id.chars().allMatch(Character::isDigit)) {
+            return null;
+        }
+
+        return new Organization(id, group.getName(), group.getWebUrl());
+    }
 }
 
